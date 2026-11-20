@@ -16,10 +16,12 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 # ───────────── 설정 (환경변수로 바꿀 수 있음) ─────────────
@@ -27,7 +29,8 @@ API = "https://api.bithumb.com/v1"
 PERIOD = 14
 THRESHOLD = float(os.getenv("WR_THRESHOLD", "-80"))
 INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))   # 감시 주기 (초)
-REQ_PER_SEC = float(os.getenv("REQ_PER_SEC", "8"))           # 빗썸 한도(초당 150회)보다 한참 낮게
+REQ_PER_SEC = float(os.getenv("REQ_PER_SEC", "20"))          # 빗썸 한도(초당 150회)보다 한참 낮게
+WORKERS = int(os.getenv("WORKERS", "10"))                     # 동시 요청 수 (해외 서버 지연 보완)
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wr_state.json"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -39,30 +42,42 @@ def log(msg):
 
 
 # ───────────── 빗썸 API ─────────────
-_last_req = 0.0
+_next_slot = 0.0
+_slot_lock = threading.Lock()
+
+
+def _throttle():
+    """여러 스레드가 함께 써도 전체 요청 속도가 REQ_PER_SEC를 넘지 않게."""
+    global _next_slot
+    with _slot_lock:
+        now = time.monotonic()
+        slot = max(now, _next_slot)
+        _next_slot = slot + 1.0 / REQ_PER_SEC
+    if slot > now:
+        time.sleep(slot - now)
 
 
 def api_get(path, params):
-    """요청 간격을 지키면서 GET. 429/5xx/네트워크 오류는 지수 백오프로 재시도."""
-    global _last_req
+    """요청 간격을 지키면서 GET. 429/5xx/네트워크 오류는 백오프로 재시도."""
     url = f"{API}{path}?{urllib.parse.urlencode(params)}"
-    for attempt in range(5):
-        wait = 1.0 / REQ_PER_SEC - (time.monotonic() - _last_req)
-        if wait > 0:
-            time.sleep(wait)
-        _last_req = time.monotonic()
+    last_err = None
+    for attempt in range(3):
+        _throttle()
         try:
-            req = urllib.request.Request(url, headers={"accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            req = urllib.request.Request(url, headers={"accept": "application/json",
+                                                       "user-agent": "wr-alert/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
             if e.code == 429 or e.code >= 500:
                 time.sleep(2 ** attempt)
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_err = repr(e)
             time.sleep(2 ** attempt)
-    raise RuntimeError(f"요청 실패(재시도 초과): {url}")
+    raise RuntimeError(f"요청 실패(재시도 초과, {last_err}): {url}")
 
 
 def krw_markets():
@@ -160,15 +175,41 @@ def fmt_price(p):
 def run_cycle(state, dry=False):
     t0 = time.monotonic()
     markets = krw_markets()
+    log(f"KRW 마켓 {len(markets)}개 조회 완료 ({time.monotonic() - t0:.1f}초)")
     today = datetime.now(KST).date().isoformat()
     hits, errors = [], 0
 
-    for m, name in markets.items():
+    def safe_eval(m):
         try:
-            r = evaluate(m)
+            return m, evaluate(m), None
         except Exception as e:
+            return m, None, e
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        results = list(ex.map(safe_eval, markets))
+
+    # 진행 확인용: 주봉 WR이 가장 낮은 5개 코인을 매번 로그에 남김
+    ok = sorted(((m, r) for m, r, err in results if err is None and r["wr_w"] is not None),
+                key=lambda x: x[1]["wr_w"])
+    top = []
+    for m, r in ok[:5]:
+        wr_d = r["wr_d"]
+        if wr_d is None:
+            try:
+                wr_d = williams_r(candles(m, "days"))
+            except Exception:
+                pass
+        wd = "-" if wr_d is None else f"{wr_d:.1f}"
+        top.append(f"{markets[m]}({m.split('-', 1)[1]}) 주 {r['wr_w']:.1f}/일 {wd}")
+    if top:
+        log("주봉 WR 최저 5개: " + ", ".join(top))
+
+    for m, r, err in results:
+        name = markets[m]
+        if err is not None:
             errors += 1
-            log(f"{m} 조회 실패: {e}")
+            if errors <= 5:
+                log(f"{m} 조회 실패: {err}")
             continue  # 실패한 코인은 상태를 건드리지 않음
         was = state["active"].get(m, False)
         # 조건이 '새로' 충족됐을 때만 + 같은 코인은 하루 1번만
