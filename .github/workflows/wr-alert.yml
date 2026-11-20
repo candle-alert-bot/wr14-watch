@@ -1,0 +1,35 @@
+name: wr-alert
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분 밀릴 수 있음)
+  workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+
+permissions:
+  contents: write            # 중복 알림 방지용 상태 파일 저장
+
+concurrency:
+  group: wr-alert            # 실행이 겹치지 않게
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: WR 감시 1회 실행
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_FILE: wr_state.json
+        run: python3 wr_alert.py --once
+
+      - name: 상태 파일 저장 (바뀌었을 때만)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -f wr_state.json ] || exit 0
+          git add wr_state.json
+          git diff --cached --quiet || (git commit -m "update state" && git push)
