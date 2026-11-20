@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분 밀릴 수 있음)
   workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+    inputs:
+      threshold:
+        description: "테스트용 기준값 (예: -30). 그대로 두면 -80"
+        required: false
+        default: "-80"
 
 permissions:
   contents: write            # 중복 알림 방지용 상태 파일 저장
@@ -24,9 +29,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: wr_state.json
+          WR_THRESHOLD: ${{ inputs.threshold || '-80' }}
         run: python3 wr_alert.py --once
 
-      - name: 상태 파일 저장 (바뀌었을 때만)
+      - name: 상태 파일 저장 (바뀌었을 때만, 테스트 기준값 실행은 저장 안 함)
+        if: ${{ !inputs.threshold || inputs.threshold == '-80' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
