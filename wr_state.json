@@ -6,14 +6,17 @@
   "wins": 0,
   "sum": 0.0
  },
- "last_run": "2026-11-21 07:04",
+ "last_run": "2026-11-21 07:11",
  "b_open": [
   {
    "m": "KRW-RLC",
    "name": "아이젝",
    "date": "2026-10-31",
    "entry": 582.7777777777778,
-   "backfill": true
+   "backfill": true,
+   "tgt_prev": null,
+   "tgt_today": 720.5166666666667,
+   "day": "2026-11-21"
   }
  ],
  "b_alerted": {},
@@ -23,5 +26,14 @@
   "sum": 0.0
  },
  "b_init": true,
- "b_daily": "2026-11-20"
+ "b_daily": "2026-11-20",
+ "b_watch": {
+  "KRW-MPLX": {
+   "name": "메타플렉스",
+   "level": 68.31844444444444,
+   "tgt": 80.51483333333334,
+   "day": "2026-11-21"
+  }
+ },
+ "b_rt": {}
 }
