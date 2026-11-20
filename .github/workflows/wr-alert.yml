@@ -4,7 +4,8 @@ on:
   schedule:
     - cron: "5 15 * * *"    # 매일 00:05 (한국시간) — 일봉 마감 직후 확인
     - cron: "40 15 * * *"   # 00:40 한 번 더 (GitHub 실행 지연·누락 대비, 중복 알림 없음)
-  workflow_dispatch:         # Actions 탭에서 수동 실행
+    - cron: "20 * * * *"    # 매시 20분 — 장중 지정가 체결·목표가 도달 확인 (90일선 전략)
+  workflow_dispatch:         # Actions 탭에서 수동 실행 (자정 확인과 같은 동작)
 
 permissions:
   contents: write            # 알림·가상 매매 기록 저장
@@ -24,7 +25,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 wr_alert.py
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$SCHEDULE" = "20 * * * *" ]; then
+            python3 wr_alert.py --intraday
+          else
+            python3 wr_alert.py
+          fi
 
       - name: 기록 저장 (바뀌었을 때만)
         run: |
