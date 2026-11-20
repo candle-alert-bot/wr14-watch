@@ -17,6 +17,8 @@
   (같은 급등 고점에서는 첫 번째 터치만), 20일 평균 거래대금 1억 이상
   → 60일선에 닿으면 매도 (60일선이 매수가보다 위일 때만), 손절 없음, 최대 60일 보유
   매일 자정 직후 '오늘 매수 대기 목록'(90일선 지정가, 60일선 목표가)과 가상 체결·청산을 알림
+  장중(--intraday, 매시간): 대기 코인이 지정가에 닿으면 바로 '체결(가상)' 알림,
+  보유 코인이 그날 목표가에 닿으면 바로 '목표 도달' 알림
 
 백테스트(빗썸 2020 ~ 2026-11)에서 고른 조건이며, 미래 수익을 보장하지 않습니다.
 외부 패키지 없이 파이썬 표준 라이브러리만 사용 (Python 3.9+)
@@ -25,6 +27,7 @@
   python3 wr_alert.py                 # 신호 확인 + 가상 매매 결과 업데이트 (하루 1번, 자정 직후 실행)
   python3 wr_alert.py --dry-run       # 텔레그램 대신 화면 출력
   python3 wr_alert.py --check KRW-BTC # 특정 코인의 현재 상태 확인
+  python3 wr_alert.py --intraday      # 장중 확인 (90일선 전략 지정가 체결·목표 도달)
 """
 import argparse
 import csv
@@ -128,6 +131,15 @@ def daily_rows(market, today):
         rows[t] = (t, float(c["high_price"]), float(c["low_price"]),
                    float(c["trade_price"]), float(c["candle_acc_trade_price"]), float(c["opening_price"]))
     return [rows[k] for k in sorted(rows)]
+
+
+def today_candle(market, today):
+    """진행 중인 오늘 일봉 (시가, 고가, 저가, 현재가). 없으면 None"""
+    data = api_get("/candles/days", {"market": market, "count": 1})
+    if not data or data[0]["candle_date_time_kst"][:10] != today:
+        return None
+    c = data[0]
+    return float(c["opening_price"]), float(c["high_price"]), float(c["low_price"]), float(c["trade_price"])
 
 
 # ───────────── 지표 · 신호 계산 (백테스트와 같은 방식) ─────────────
@@ -300,6 +312,8 @@ def load_state():
     s.setdefault("b_open", [])
     s.setdefault("b_alerted", {})
     s.setdefault("b_stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.setdefault("b_watch", {})
+    s.setdefault("b_rt", {})          # 장중 알림 보낸 기록 {"fill:KRW-X": 날짜, "tp:KRW-X": 날짜}
     s.pop("active", None)           # 이전 버전 항목 정리
     return s
 
@@ -494,7 +508,17 @@ def run_strategy_b(state, markets, data, dry):
                 watch.append((m, name, w))
     state["b_init"] = True
 
-    # 3) 알림
+    # 오늘 장중 확인용 목록 저장 + 보유 코인의 오늘 목표가 갱신
+    day = (datetime.strptime(last_day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") if last_day else None
+    state["b_watch"] = {m: {"name": name, "level": w["level"], "tgt": w["tgt"], "day": day} for m, name, w in watch}
+    for o in state["b_open"]:
+        rows, _ = data.get(o["m"], (None, None))
+        if rows and o.get("day") != day:
+            o["tgt_prev"] = o.get("tgt_today")
+            o["tgt_today"], o["day"] = b_today_target(rows), day
+
+    # 3) 알림 (장중에 이미 체결 알림을 보낸 코인은 생략)
+    fills = [(o, s) for o, s in fills if state["b_rt"].get("fill:" + o["m"]) != s["date"]]
     if fills:
         lines = [f"🔵 [90일선] 가상 체결 {len(fills)}개 ({fills[0][1]['date'][5:]} 장중 90일선 터치)", ""]
         for o, s in fills:
@@ -519,22 +543,77 @@ def run_strategy_b(state, markets, data, dry):
                     f"   🎯 목표 60일선 {fmt_price(w['tgt'])}원 ({(w['tgt'] / w['level'] - 1) * 100:+.0f}%)",
                     f"   급등 고점 {fmt_price(w['peak'])}원 ({w['peak_date'][5:]}) 대비 {(w['level'] / w['peak'] - 1) * 100:.0f}%", ""]
     if state["b_open"] and daily:
-        msg += ["📌 [90일선] 가상 보유 중 (오늘 목표가)"]
+        msg += ["📌 [90일선] 가상 보유 중 · 오늘 매도 목표가 (60일선)"]
         for o in state["b_open"]:
             rows, _ = data.get(o["m"], (None, None))
             if not rows:
                 continue
             tg, cl = b_today_target(rows), rows[-1][3]
             days = (datetime.strptime(rows[-1][0], "%Y-%m-%d") - datetime.strptime(o["date"], "%Y-%m-%d")).days
-            msg.append(f"• {o['name']} ({o['m'][4:]}) {o['date'][5:]} 매수 {fmt_price(o['entry'])} · 현재 {fmt_price(cl)} "
-                       f"({(cl / o['entry'] - 1) * 100:+.0f}%) · 목표 {fmt_price(tg)} · {days}/{B_MAX_HOLD}일"
-                       + (" · 이전 신호 이어받음" if o.get("backfill") else ""))
+            prev = o.get("tgt_prev")
+            chg = f" (전날 {fmt_price(prev)}에서 {(tg / prev - 1) * 100:+.1f}%)" if prev else ""
+            note = "목표가가 매수가 아래라 아직 매도 안 함" if tg <= o["entry"] else f"매수가 대비 {(tg / o['entry'] - 1) * 100:+.0f}%"
+            msg += [f"• {o['name']} ({o['m'][4:]}) · {o['date'][5:]} 매수 {fmt_price(o['entry'])} · {days}/{B_MAX_HOLD}일"
+                    + (" · 이전 신호 이어받음" if o.get("backfill") else ""),
+                    f"   🎯 오늘 목표 {fmt_price(tg)}원{chg} · {note}",
+                    f"   어제 종가 {fmt_price(cl)} ({(cl / o['entry'] - 1) * 100:+.0f}%)"]
     if closed:
         msg += ["", "[90일선] 가상 매매 결과", ""] + closed
         msg.append(f"📊 [90일선] 누적: {st['n']}건 · 승률 {st['wins'] / st['n'] * 100:.0f}% · 평균 {st['sum'] / st['n'] * 100:+.1f}%")
     if msg:
         send_telegram("\n".join(msg).strip(), dry)
     return len(fills), len(closed)
+
+
+def run_intraday(dry=False):
+    """장중: 대기 코인의 지정가 체결, 보유 코인의 오늘 목표가 도달을 바로 알림 (가상)"""
+    t0 = time.monotonic()
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    state = load_state()
+    rt = state["b_rt"]
+    watch = {m: w for m, w in state["b_watch"].items() if w.get("day") == today and rt.get("fill:" + m) != today}
+    held = [o for o in state["b_open"] if o.get("day") == today and o.get("tgt_today")
+            and o["tgt_today"] > o["entry"] and rt.get("tp:" + o["m"]) != today and o["date"] < today]
+    need = sorted(set(watch) | {o["m"] for o in held})
+    if not need:
+        log("장중 확인할 코인 없음")
+        return
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        cand = dict(zip(need, ex.map(lambda m: _safe(today_candle, m, today), need)))
+    fills, tps = [], []
+    for m, w in watch.items():
+        k = cand.get(m)
+        if k and k[2] <= w["level"]:
+            entry = min(k[0], w["level"])
+            rt["fill:" + m] = today
+            fills.append(f"• {w['name']} ({m[4:]})\n"
+                         f"   매수가 {fmt_price(entry)}원 (90일선 {fmt_price(w['level'])}) · 지금 {fmt_price(k[3])}원\n"
+                         f"   🎯 목표 60일선 {fmt_price(w['tgt'])}원 ({(w['tgt'] / entry - 1) * 100:+.0f}%, 내일부터 매일 바뀜)")
+    for o in held:
+        k = cand.get(o["m"])
+        if k and k[1] >= o["tgt_today"]:
+            px = max(k[0], o["tgt_today"])
+            r = px / o["entry"] * (1 - FEE) ** 2 - 1
+            rt["tp:" + o["m"]] = today
+            tps.append(f"• {o['name']} ({o['m'][4:]}) {fmt_price(o['entry'])} → {fmt_price(px)}원  {r * 100:+.1f}% · 지금 {fmt_price(k[3])}원")
+    if fills:
+        send_telegram(f"🔵 [90일선] 지정가 체결 (가상) {len(fills)}개\n\n" + "\n".join(fills)
+                      + "\n\n손절 없음 · 최대 60일 보유 · 확정 기록은 자정에", dry)
+    if tps:
+        send_telegram(f"✅ [90일선] 목표가 도달 (가상) {len(tps)}개\n\n" + "\n".join(tps)
+                      + "\n\n확정 결과와 누적 성적은 자정에", dry)
+    cutoff = (datetime.now(KST) - timedelta(days=7)).strftime("%Y-%m-%d")
+    state["b_rt"] = {k: d for k, d in rt.items() if d >= cutoff}
+    save_state(state)
+    log(f"장중: 대기 {len(watch)}개·보유 {len(held)}개 확인, 체결 {len(fills)}개, 목표 도달 {len(tps)}개, {time.monotonic() - t0:.0f}초")
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:
+        log(f"조회 실패 {a[0]}: {e}")
+        return None
 
 
 def check(market):
@@ -557,6 +636,7 @@ def main():
     ap = argparse.ArgumentParser(description="빗썸 과매도 반등 신호 알림")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--check", metavar="MARKET")
+    ap.add_argument("--intraday", action="store_true")
     a = ap.parse_args()
     if a.check:
         check(a.check.upper())
@@ -564,7 +644,10 @@ def main():
     if not a.dry_run and not (TG_TOKEN and TG_CHAT):
         log("텔레그램 설정이 없어 화면 출력 모드로 실행합니다.")
     try:
-        run_once(a.dry_run)
+        if a.intraday:
+            run_intraday(a.dry_run)
+        else:
+            run_once(a.dry_run)
     except Exception as e:
         log(f"실행 오류: {e}")
         sys.exit(1)
