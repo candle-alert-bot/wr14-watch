@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-빗썸 KRW 전 종목 WR(14) 알림 봇
-- 주봉 WR(14)과 일봉 WR(14)이 '장중에' 동시에 -80 이하가 되면 텔레그램으로 알림
-- 진행 중인 봉(이번 주 / 오늘)을 포함해 계산 → 빗썸 앱 차트 값과 같은 방식
-- 외부 패키지 없이 파이썬 표준 라이브러리만 사용 (Python 3.9+)
+빗썸 KRW 코인 '과매도 반등' 신호 알림 + 가상 매매 기록 봇
+
+[매수 신호]
+  주봉 WR(14)과 일봉 WR(14)이 둘 다 -85 이하인 날이 14일 이상 이어진 뒤,
+  처음으로 일봉이 상승 마감(전일 종가보다 높게 마감)한 날
+  + 최근 20일 평균 하루 거래대금 1억원 이상
+  → 그날 종가를 기준가로 알림
+
+[매도 기준 (가상 매매)]
+  익절 +15% / 손절 -10% / 최대 30일 보유 (같은 날 둘 다 닿으면 손절로 처리)
+
+백테스트(빗썸 2023-02 ~ 2026-11)에서 고른 조건이며, 미래 수익을 보장하지 않습니다.
+외부 패키지 없이 파이썬 표준 라이브러리만 사용 (Python 3.9+)
 
 사용법
-  python3 wr_alert.py                 # 5분마다 계속 감시
-  python3 wr_alert.py --once          # 한 바퀴만 돌고 종료 (cron용)
-  python3 wr_alert.py --dry-run       # 텔레그램 대신 화면에 출력
-  python3 wr_alert.py --check KRW-ELSA  # 특정 코인의 주봉/일봉 WR 값 확인 (앱 차트와 대조용)
-  python3 wr_alert.py --test-telegram # 텔레그램 연결 테스트
+  python3 wr_alert.py                 # 신호 확인 + 가상 매매 결과 업데이트 (하루 1번, 자정 직후 실행)
+  python3 wr_alert.py --dry-run       # 텔레그램 대신 화면 출력
+  python3 wr_alert.py --check KRW-BTC # 특정 코인의 현재 상태 확인
 """
 import argparse
+import csv
 import json
 import os
 import sys
@@ -24,14 +32,25 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-# ───────────── 설정 (환경변수로 바꿀 수 있음) ─────────────
-API = "https://api.bithumb.com/v1"
+# ───────────── 전략 설정 ─────────────
+WR_TH = float(os.getenv("WR_THRESHOLD", "-85"))   # 주봉·일봉 WR 기준
+RUN_DAYS = int(os.getenv("RUN_DAYS", "14"))        # 기준 이하 연속 일수
+MIN_LIQ = float(os.getenv("MIN_LIQ", "1e8"))       # 20일 평균 하루 거래대금 하한 (원)
+TP = float(os.getenv("TAKE_PROFIT", "0.15"))       # 익절 +15%
+SL = float(os.getenv("STOP_LOSS", "0.10"))         # 손절 -10%
+MAX_HOLD = int(os.getenv("MAX_HOLD_DAYS", "30"))   # 최대 보유 일수
+FEE = 0.001                                        # 가상 결과 계산용 수수료 (편도)
 PERIOD = 14
-THRESHOLD = float(os.getenv("WR_THRESHOLD", "-80"))
-INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))   # 감시 주기 (초)
-REQ_PER_SEC = float(os.getenv("REQ_PER_SEC", "20"))          # 빗썸 한도(초당 150회)보다 한참 낮게
-WORKERS = int(os.getenv("WORKERS", "10"))                     # 동시 요청 수 (해외 서버 지연 보완)
-STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wr_state.json"))
+CANDLES = 200
+EXCLUDE = {"USDT", "USDC", "USDE", "USDS", "USD1", "USDG", "DAI", "PAXG", "XAUT", "FDUSD", "PYUSD", "TUSD"}
+
+# ───────────── 실행 설정 ─────────────
+API = "https://api.bithumb.com/v1"
+REQ_PER_SEC = float(os.getenv("REQ_PER_SEC", "20"))
+WORKERS = int(os.getenv("WORKERS", "10"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(BASE_DIR, "wr_state.json"))
+TRADES_FILE = os.getenv("TRADES_FILE", os.path.join(BASE_DIR, "trades.csv"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 KST = timezone(timedelta(hours=9))
@@ -47,7 +66,6 @@ _slot_lock = threading.Lock()
 
 
 def _throttle():
-    """여러 스레드가 함께 써도 전체 요청 속도가 REQ_PER_SEC를 넘지 않게."""
     global _next_slot
     with _slot_lock:
         now = time.monotonic()
@@ -58,14 +76,12 @@ def _throttle():
 
 
 def api_get(path, params):
-    """요청 간격을 지키면서 GET. 429/5xx/네트워크 오류는 백오프로 재시도."""
     url = f"{API}{path}?{urllib.parse.urlencode(params)}"
     last_err = None
     for attempt in range(3):
         _throttle()
         try:
-            req = urllib.request.Request(url, headers={"accept": "application/json",
-                                                       "user-agent": "wr-alert/1.0"})
+            req = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "wr-alert/2.0"})
             with urllib.request.urlopen(req, timeout=8) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
@@ -77,60 +93,109 @@ def api_get(path, params):
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             last_err = repr(e)
             time.sleep(2 ** attempt)
-    raise RuntimeError(f"요청 실패(재시도 초과, {last_err}): {url}")
+    raise RuntimeError(f"요청 실패({last_err}): {url}")
 
 
 def krw_markets():
     data = api_get("/market/all", {"isDetails": "false"})
-    return {d["market"]: d.get("korean_name", "") for d in data if d["market"].startswith("KRW-")}
+    return {d["market"]: d.get("korean_name", "") for d in data
+            if d["market"].startswith("KRW-") and d["market"][4:] not in EXCLUDE}
 
 
-def candles(market, unit):
-    """unit: 'weeks' 또는 'days'. 최신 봉이 [0] (진행 중인 봉 포함)."""
-    return api_get(f"/candles/{unit}", {"market": market, "count": PERIOD})
+def daily_rows(market, today):
+    """마감된 일봉만, 오래된 순. 각 행: (날짜, 고가, 저가, 종가, 거래대금)"""
+    data = api_get("/candles/days", {"market": market, "count": CANDLES})
+    rows = {}
+    for c in data:
+        t = c["candle_date_time_kst"][:10]
+        if t >= today:          # 진행 중인 오늘 봉은 제외
+            continue
+        rows[t] = (t, float(c["high_price"]), float(c["low_price"]),
+                   float(c["trade_price"]), float(c["candle_acc_trade_price"]))
+    return [rows[k] for k in sorted(rows)]
 
 
-# ───────────── 지표 계산 ─────────────
-def williams_r(cs, period=PERIOD):
-    """
-    WR = (최근 N봉 최고가 − 현재가) / (최근 N봉 최고가 − 최근 N봉 최저가) × (−100)
-    cs: 최신순 캔들 리스트. 봉이 부족하거나 변동이 0이면 None.
-    """
-    if len(cs) < period:
-        return None
-    window = cs[:period]
-    hh = max(float(c["high_price"]) for c in window)
-    ll = min(float(c["low_price"]) for c in window)
-    close = float(window[0]["trade_price"])
-    if hh == ll:
-        return None
-    return (hh - close) / (hh - ll) * -100.0
+# ───────────── 지표 · 신호 계산 (백테스트와 같은 방식) ─────────────
+def week_key(t):
+    d = datetime.strptime(t, "%Y-%m-%d")
+    return (d - timedelta(days=d.weekday())).strftime("%Y-%m-%d")
 
 
-def evaluate(market, full=False):
-    """
-    주봉을 먼저 보고(더 드물게 -80 아래로 감), 통과한 코인만 일봉을 조회 → 요청 수 절약.
-    full=True면 조건과 상관없이 둘 다 계산.
-    """
-    w = candles(market, "weeks")
-    wr_w = williams_r(w)
-    price = float(w[0]["trade_price"]) if w else None
-    if not full and (wr_w is None or wr_w > THRESHOLD):
-        return {"wr_w": wr_w, "wr_d": None, "price": price, "hit": False}
-    wr_d = williams_r(candles(market, "days"))
-    hit = wr_w is not None and wr_d is not None and wr_w <= THRESHOLD and wr_d <= THRESHOLD
-    return {"wr_w": wr_w, "wr_d": wr_d, "price": price, "hit": hit}
+def indicators(rows):
+    n = len(rows)
+    t = [r[0] for r in rows]; h = [r[1] for r in rows]; l = [r[2] for r in rows]
+    c = [r[3] for r in rows]; v = [r[4] for r in rows]
+    wr_d = [None] * n
+    wr_w = [None] * n
+    liq = [0.0] * n
+    wk, w_hi, w_lo = [], [], []
+    s = 0.0
+    for i in range(n):
+        if i >= PERIOD - 1:
+            hh = max(h[i - PERIOD + 1:i + 1]); ll = min(l[i - PERIOD + 1:i + 1])
+            if hh > ll:
+                wr_d[i] = (hh - c[i]) / (hh - ll) * -100
+        key = week_key(t[i])
+        if not wk or wk[-1] != key:
+            wk.append(key); w_hi.append(h[i]); w_lo.append(l[i])
+        else:
+            w_hi[-1] = max(w_hi[-1], h[i]); w_lo[-1] = min(w_lo[-1], l[i])
+        k = len(wk) - 1
+        if k >= PERIOD - 1:
+            hh = max([w_hi[k]] + w_hi[k - PERIOD + 1:k]); ll = min([w_lo[k]] + w_lo[k - PERIOD + 1:k])
+            if hh > ll:
+                wr_w[i] = (hh - c[i]) / (hh - ll) * -100
+        liq[i] = s / min(20, i) if i else 0.0      # 직전 20일 평균 (당일 제외)
+        s += v[i]
+        if i >= 20:
+            s -= v[i - 20]
+    return t, h, l, c, wr_d, wr_w, liq
 
 
-# ───────────── 상태 저장 (중복 알림 방지) ─────────────
+def evaluate(rows):
+    """마지막 마감일 기준 상태와 신호 여부"""
+    t, h, l, c, wr_d, wr_w, liq = indicators(rows)
+    n = len(rows)
+    both = lambda i: wr_d[i] is not None and wr_w[i] is not None and wr_d[i] <= WR_TH and wr_w[i] <= WR_TH
+    run, fired, signal, run_at_signal = 0, False, False, 0
+    for i in range(1, n):
+        if run >= RUN_DAYS and not fired and c[i] > c[i - 1]:
+            fired = True
+            if i == n - 1:
+                signal, run_at_signal = True, run
+        if both(i):
+            run += 1
+        else:
+            run, fired = 0, False
+    L = n - 1
+    return {"date": t[L], "close": c[L], "wr_d": wr_d[L], "wr_w": wr_w[L], "liq": liq[L],
+            "run": run, "signal": signal and liq[L] >= MIN_LIQ, "raw_signal": signal, "run_at_signal": run_at_signal}
+
+
+def resolve(trade, rows):
+    """가상 매매 결과. 진입일 다음 날부터 순서대로: 손절 → 익절 → 기간 만료"""
+    after = [r for r in rows if r[0] > trade["date"]]
+    for k, (t, hi, lo, cl, _) in enumerate(after, start=1):
+        if lo <= trade["sl"]:
+            return {"result": "손절", "exit_date": t, "exit": trade["sl"], "days": k}
+        if hi >= trade["tp"]:
+            return {"result": "익절", "exit_date": t, "exit": trade["tp"], "days": k}
+        if k >= MAX_HOLD:
+            return {"result": "기간만료", "exit_date": t, "exit": cl, "days": k}
+    return None
+
+
+# ───────────── 상태 · 기록 ─────────────
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             s = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         s = {}
-    s.setdefault("active", {})    # 직전 확인 때 조건 충족 여부
-    s.setdefault("alerted", {})   # 마지막 알림 날짜(KST)
+    s.setdefault("alerted", {})
+    s.setdefault("open", [])
+    s.setdefault("stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.pop("active", None)           # 이전 버전 항목 정리
     return s
 
 
@@ -141,18 +206,25 @@ def save_state(s):
     os.replace(tmp, STATE_FILE)
 
 
+def append_trade(row):
+    new = not os.path.exists(TRADES_FILE)
+    with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["신호일", "마켓", "이름", "기준가", "익절가", "손절가", "청산일", "청산가", "결과", "수익률(%)", "보유일"])
+        w.writerow(row)
+
+
 # ───────────── 텔레그램 ─────────────
 def send_telegram(text, dry=False):
     if dry or not (TG_TOKEN and TG_CHAT):
         print("─── 알림 ───\n" + text + "\n────────────", flush=True)
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    # 텔레그램 메시지 길이 제한(4096자) 대비 분할
     chunks, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 3800:
-            chunks.append(cur)
-            cur = ""
+            chunks.append(cur); cur = ""
         cur += line + "\n"
     if cur:
         chunks.append(cur)
@@ -168,112 +240,126 @@ def send_telegram(text, dry=False):
 
 
 def fmt_price(p):
-    return f"{p:,.10g}" if p is not None else "-"
+    if p >= 100000:
+        return f"{round(p):,}"
+    if p >= 1:
+        return f"{p:,.5g}"
+    return f"{p:.4g}"
 
 
-# ───────────── 한 바퀴 감시 ─────────────
-def run_cycle(state, dry=False):
+def fmt_won(x):
+    return f"{x / 1e8:,.1f}억" if x >= 1e8 else f"{x / 1e4:,.0f}만"
+
+
+# ───────────── 한 번 실행 ─────────────
+def run_once(dry=False):
     t0 = time.monotonic()
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    state = load_state()
     markets = krw_markets()
-    log(f"KRW 마켓 {len(markets)}개 조회 완료 ({time.monotonic() - t0:.1f}초)")
-    today = datetime.now(KST).date().isoformat()
-    hits, errors = [], 0
+    need = set(markets) | {o["m"] for o in state["open"]}
+    log(f"마켓 {len(markets)}개 조회")
 
-    def safe_eval(m):
+    def fetch(m):
         try:
-            return m, evaluate(m), None
+            return m, daily_rows(m, today), None
         except Exception as e:
             return m, None, e
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        results = list(ex.map(safe_eval, markets))
+        data = {m: (rows, err) for m, rows, err in ex.map(fetch, sorted(need))}
+    errors = sum(1 for _, e in data.values() if e)
 
-    # 진행 확인용: 주봉 WR이 가장 낮은 5개 코인을 매번 로그에 남김
-    ok = sorted(((m, r) for m, r, err in results if err is None and r["wr_w"] is not None),
-                key=lambda x: x[1]["wr_w"])
-    top = []
-    for m, r in ok[:5]:
-        wr_d = r["wr_d"]
-        if wr_d is None:
-            try:
-                wr_d = williams_r(candles(m, "days"))
-            except Exception:
-                pass
-        wd = "-" if wr_d is None else f"{wr_d:.1f}"
-        top.append(f"{markets[m]}({m.split('-', 1)[1]}) 주 {r['wr_w']:.1f}/일 {wd}")
-    if top:
-        log("주봉 WR 최저 5개: " + ", ".join(top))
+    # 1) 가상 매매 결과 업데이트
+    closed_msgs, still_open = [], []
+    for o in state["open"]:
+        rows, err = data.get(o["m"], (None, None))
+        if not rows:
+            still_open.append(o)
+            continue
+        res = resolve(o, rows)
+        if not res:
+            still_open.append(o)
+            continue
+        r = res["exit"] / o["entry"] * (1 - FEE) ** 2 - 1
+        st = state["stats"]; st["n"] += 1; st["sum"] += r; st["wins"] += 1 if r > 0 else 0
+        append_trade([o["date"], o["m"], o["name"], o["entry"], o["tp"], o["sl"], res["exit_date"],
+                      res["exit"], res["result"], round(r * 100, 2), res["days"]])
+        icon = {"익절": "✅", "손절": "🛑", "기간만료": "⏳"}[res["result"]]
+        closed_msgs.append(f"{icon} {res['result']} · {o['name']} ({o['m'][4:]})\n"
+                           f"   {fmt_price(o['entry'])} → {fmt_price(res['exit'])}원  {r * 100:+.1f}%  ({res['days']}일 보유)")
+    state["open"] = still_open
 
-    for m, r, err in results:
-        name = markets[m]
-        if err is not None:
-            errors += 1
-            if errors <= 5:
-                log(f"{m} 조회 실패: {err}")
-            continue  # 실패한 코인은 상태를 건드리지 않음
-        was = state["active"].get(m, False)
-        # 조건이 '새로' 충족됐을 때만 + 같은 코인은 하루 1번만
-        if r["hit"] and not was and state["alerted"].get(m) != today:
-            hits.append((m, name, r))
-            state["alerted"][m] = today
-        state["active"][m] = r["hit"]
+    # 2) 새 매수 신호
+    signals = []
+    for m, name in markets.items():
+        rows, err = data.get(m, (None, None))
+        if not rows or len(rows) < 120:
+            continue
+        ev = evaluate(rows)
+        if ev["signal"] and state["alerted"].get(m) != ev["date"]:
+            state["alerted"][m] = ev["date"]
+            entry = ev["close"]
+            o = {"m": m, "name": name, "date": ev["date"], "entry": entry,
+                 "tp": entry * (1 + TP), "sl": entry * (1 - SL)}
+            state["open"].append(o)
+            signals.append((o, ev))
 
-    # 상장폐지된 마켓 정리
-    for k in ("active", "alerted"):
-        state[k] = {m: v for m, v in state[k].items() if m in markets}
+    # 3) 알림
+    if signals:
+        lines = [f"🟢 매수 신호 {len(signals)}개 (주봉·일봉 WR ≤ {WR_TH:g} {RUN_DAYS}일↑ 후 첫 상승 마감)", ""]
+        for o, ev in signals:
+            exp = (datetime.strptime(o["date"], "%Y-%m-%d") + timedelta(days=MAX_HOLD)).strftime("%m/%d")
+            lines += [f"• {o['name']} ({o['m'][4:]})",
+                      f"   기준가 {fmt_price(o['entry'])}원 ({o['date'][5:]} 종가)",
+                      f"   🎯 익절 {fmt_price(o['tp'])}원 (+{TP * 100:g}%)",
+                      f"   🛑 손절 {fmt_price(o['sl'])}원 (-{SL * 100:g}%)",
+                      f"   ⏳ 최대 {exp}까지 보유",
+                      f"   주봉 {ev['wr_w']:.1f} / 일봉 {ev['wr_d']:.1f} · {ev['run_at_signal']}일 연속 후 반등 · 거래대금 {fmt_won(ev['liq'])}/일",
+                      ""]
+        send_telegram("\n".join(lines).rstrip(), dry)
+    if closed_msgs:
+        st = state["stats"]
+        summary = (f"📊 누적 가상 성적: {st['n']}건 · 승률 {st['wins'] / st['n'] * 100:.0f}% · "
+                   f"평균 {st['sum'] / st['n'] * 100:+.1f}%") if st["n"] else ""
+        send_telegram("가상 매매 결과\n\n" + "\n".join(closed_msgs) + ("\n\n" + summary if summary else ""), dry)
+
+    # 오래된 기록 정리 + 실행 기록
+    cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
+    state["alerted"] = {m: d for m, d in state["alerted"].items() if d >= cutoff}
+    state["last_run"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     save_state(state)
+    log(f"신호 {len(signals)}개, 청산 {len(closed_msgs)}개, 보유 중 {len(state['open'])}개, "
+        f"조회 실패 {errors}개, {time.monotonic() - t0:.0f}초")
 
-    if hits:
-        lines = [f"🔔 주봉·일봉 WR({PERIOD}) ≤ {THRESHOLD:g} 동시 터치 ({len(hits)}개)", ""]
-        for m, name, r in sorted(hits, key=lambda x: x[2]["wr_w"]):
-            sym = m.split("-", 1)[1]
-            lines.append(f"• {name} ({sym})  {fmt_price(r['price'])}원")
-            lines.append(f"   주봉 {r['wr_w']:.1f} / 일봉 {r['wr_d']:.1f}")
-        send_telegram("\n".join(lines), dry)
 
-    log(f"{len(markets)}개 확인, 신규 알림 {len(hits)}개, 실패 {errors}개, "
-        f"{time.monotonic() - t0:.0f}초 소요")
+def check(market):
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    rows = daily_rows(market, today)
+    ev = evaluate(rows)
+    f = lambda x: "-" if x is None else f"{x:.1f}"
+    print(f"{market} ({ev['date']} 마감 기준)\n"
+          f"  종가 {fmt_price(ev['close'])}원 · 주봉 WR {f(ev['wr_w'])} · 일봉 WR {f(ev['wr_d'])}\n"
+          f"  둘 다 {WR_TH:g} 이하 연속: {ev['run']}일 (기준 {RUN_DAYS}일)\n"
+          f"  20일 평균 거래대금: {fmt_won(ev['liq'])}\n"
+          f"  오늘 신호: {'있음' if ev['signal'] else '없음'}")
 
 
 def main():
-    global THRESHOLD
-    ap = argparse.ArgumentParser(description="빗썸 주봉·일봉 WR(14) 동시 과매도 알림")
-    ap.add_argument("--once", action="store_true", help="한 바퀴만 돌고 종료")
-    ap.add_argument("--dry-run", action="store_true", help="텔레그램 대신 화면 출력")
-    ap.add_argument("--check", metavar="MARKET", help="특정 코인 WR 확인 (예: KRW-ELSA)")
-    ap.add_argument("--test-telegram", action="store_true", help="텔레그램 테스트 메시지 전송")
-    ap.add_argument("--threshold", type=float, help=f"기준값 (기본 {THRESHOLD:g})")
+    ap = argparse.ArgumentParser(description="빗썸 과매도 반등 신호 알림")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--check", metavar="MARKET")
     a = ap.parse_args()
-    if a.threshold is not None:
-        THRESHOLD = a.threshold
-
-    if a.test_telegram:
-        if not (TG_TOKEN and TG_CHAT):
-            sys.exit("TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 환경변수를 먼저 설정하세요.")
-        send_telegram("✅ WR 알림 봇 연결 테스트")
-        return
-
     if a.check:
-        r = evaluate(a.check.upper(), full=True)
-        f = lambda v: "계산 불가(봉 부족)" if v is None else f"{v:.2f}"
-        print(f"{a.check.upper()}  현재가 {fmt_price(r['price'])}원\n"
-              f"  주봉 WR({PERIOD}): {f(r['wr_w'])}\n  일봉 WR({PERIOD}): {f(r['wr_d'])}\n"
-              f"  알림 조건(둘 다 ≤ {THRESHOLD:g}): {'충족' if r['hit'] else '미충족'}")
+        check(a.check.upper())
         return
-
     if not a.dry_run and not (TG_TOKEN and TG_CHAT):
         log("텔레그램 설정이 없어 화면 출력 모드로 실행합니다.")
-
-    state = load_state()
-    log(f"시작: 기준 {THRESHOLD:g}, 주기 {INTERVAL_SEC}초")
-    while True:
-        try:
-            run_cycle(state, a.dry_run)
-        except Exception as e:
-            log(f"사이클 오류: {e}")
-        if a.once:
-            break
-        time.sleep(INTERVAL_SEC)
+    try:
+        run_once(a.dry_run)
+    except Exception as e:
+        log(f"실행 오류: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
