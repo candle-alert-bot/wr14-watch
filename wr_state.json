@@ -261,7 +261,7 @@
   "KRW-SKY": false,
   "KRW-PONKE": true,
   "KRW-MVL": true,
-  "KRW-CARV": true,
+  "KRW-CARV": false,
   "KRW-PUFFER": false,
   "KRW-TURBO": true,
   "KRW-RAY": false,
