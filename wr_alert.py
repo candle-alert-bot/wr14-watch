@@ -11,7 +11,14 @@
 [매도 기준 (가상 매매)]
   익절 +15% / 손절 -10% / 최대 30일 보유 (같은 날 둘 다 닿으면 손절로 처리)
 
-백테스트(빗썸 2023-02 ~ 2026-11)에서 고른 조건이며, 미래 수익을 보장하지 않습니다.
+[전략 ① 급락 코인 90일선 → 60일선 (가상 기록)]
+  최근 90일 안에 30일 저점의 2배 이상 급등한 날이 있고,
+  그 고점보다 70% 이상 낮은 가격에서 위에서 내려와 90일선에 닿으면 90일선 가격에 매수
+  (같은 급등 고점에서는 첫 번째 터치만), 20일 평균 거래대금 1억 이상
+  → 60일선에 닿으면 매도 (60일선이 매수가보다 위일 때만), 손절 없음, 최대 60일 보유
+  매일 자정 직후 '오늘 매수 대기 목록'(90일선 지정가, 60일선 목표가)과 가상 체결·청산을 알림
+
+백테스트(빗썸 2020 ~ 2026-11)에서 고른 조건이며, 미래 수익을 보장하지 않습니다.
 외부 패키지 없이 파이썬 표준 라이브러리만 사용 (Python 3.9+)
 
 사용법
@@ -42,6 +49,14 @@ MAX_HOLD = int(os.getenv("MAX_HOLD_DAYS", "30"))   # 최대 보유 일수
 FEE = 0.001                                        # 가상 결과 계산용 수수료 (편도)
 PERIOD = 14
 CANDLES = 200
+# 전략 ① 급락 코인 90일선 → 60일선
+B_ON = os.getenv("MA_STRATEGY", "1") != "0"
+B_BUY_MA, B_SELL_MA = 90, 60
+B_PUMP = 2.0          # 30일 저점 대비 고가 배수 (2배 = +100%)
+B_LOOKBACK = 90       # 급등 고점을 찾는 기간
+B_DROP = 0.70         # 급등 고점 대비 하락폭
+B_MAX_HOLD = 60
+B_MIN_AGE = 125       # 상장 후 최소 일수
 EXCLUDE = {"USDT", "USDC", "USDE", "USDS", "USD1", "USDG", "DAI", "PAXG", "XAUT", "FDUSD", "PYUSD", "TUSD"}
 
 # ───────────── 실행 설정 ─────────────
@@ -103,7 +118,7 @@ def krw_markets():
 
 
 def daily_rows(market, today):
-    """마감된 일봉만, 오래된 순. 각 행: (날짜, 고가, 저가, 종가, 거래대금)"""
+    """마감된 일봉만, 오래된 순. 각 행: (날짜, 고가, 저가, 종가, 거래대금, 시가)"""
     data = api_get("/candles/days", {"market": market, "count": CANDLES})
     rows = {}
     for c in data:
@@ -111,7 +126,7 @@ def daily_rows(market, today):
         if t >= today:          # 진행 중인 오늘 봉은 제외
             continue
         rows[t] = (t, float(c["high_price"]), float(c["low_price"]),
-                   float(c["trade_price"]), float(c["candle_acc_trade_price"]))
+                   float(c["trade_price"]), float(c["candle_acc_trade_price"]), float(c["opening_price"]))
     return [rows[k] for k in sorted(rows)]
 
 
@@ -175,7 +190,8 @@ def evaluate(rows):
 def resolve(trade, rows):
     """가상 매매 결과. 진입일 다음 날부터 순서대로: 손절 → 익절 → 기간 만료"""
     after = [r for r in rows if r[0] > trade["date"]]
-    for k, (t, hi, lo, cl, _) in enumerate(after, start=1):
+    for k, r in enumerate(after, start=1):
+        t, hi, lo, cl = r[0], r[1], r[2], r[3]
         if lo <= trade["sl"]:
             return {"result": "손절", "exit_date": t, "exit": trade["sl"], "days": k}
         if hi >= trade["tp"]:
@@ -183,6 +199,92 @@ def resolve(trade, rows):
         if k >= MAX_HOLD:
             return {"result": "기간만료", "exit_date": t, "exit": cl, "days": k}
     return None
+
+
+# ───────────── 전략 ①: 급락 코인 90일선 매수 → 60일선 매도 ─────────────
+def ma_before(c, p, i):
+    """i일 시작 시점에 알 수 있는 이동평균 = i일 이전 p개 종가 평균"""
+    return sum(c[i - p:i]) / p if i >= p else None
+
+
+def b_peak(h, l, i):
+    """i일 기준 직전 90일 안의 급등 고점 위치 (30일 저점의 2배 이상인 날 중 고가가 가장 높은 날)"""
+    pk, ph = -1, 0.0
+    for p in range(max(30, i - B_LOOKBACK), i):
+        if h[p] >= B_PUMP * min(l[p - 30:p]) and h[p] > ph:
+            ph, pk = h[p], p
+    return pk
+
+
+def b_scan(rows):
+    """창 안의 모든 신호(백테스트와 같은 순서·중복 규칙)와 마지막으로 쓴 급등 고점"""
+    n = len(rows)
+    h = [r[1] for r in rows]; l = [r[2] for r in rows]; c = [r[3] for r in rows]
+    v = [r[4] for r in rows]; o = [r[5] for r in rows]
+    start = 91 if n >= CANDLES else B_MIN_AGE
+    sigs, used = [], -1
+    for i in range(start, n):
+        m, mp = ma_before(c, B_BUY_MA, i), ma_before(c, B_BUY_MA, i - 1)
+        if not (c[i - 1] > mp and l[i] <= m):
+            continue
+        pk = b_peak(h, l, i)
+        if pk < 0:
+            continue
+        peak_high = max(h[pk:i])
+        entry = min(o[i], m)
+        if entry > peak_high * (1 - B_DROP):
+            continue
+        if sum(v[i - 20:i]) / 20 < MIN_LIQ:
+            continue
+        if pk == used:
+            continue
+        used = pk
+        tgt = ma_before(c, B_SELL_MA, i)
+        sigs.append({"i": i, "date": rows[i][0], "entry": entry, "ma90": m, "tgt": tgt,
+                     "peak": peak_high, "peak_date": rows[pk][0], "valid": tgt is not None and tgt > entry * 1.02})
+    return sigs, used
+
+
+def b_watch(rows, used):
+    """오늘(마지막 마감일 다음 날) 90일선에 닿으면 신호가 되는지와 지정가·목표가"""
+    n = len(rows)
+    if n < CANDLES and n < B_MIN_AGE:
+        return None
+    h = [r[1] for r in rows]; l = [r[2] for r in rows]; c = [r[3] for r in rows]; v = [r[4] for r in rows]
+    mp, level = ma_before(c, B_BUY_MA, n - 1), ma_before(c, B_BUY_MA, n)
+    if mp is None or not c[n - 1] > mp:
+        return None
+    pk = b_peak(h, l, n)
+    if pk < 0 or pk == used:
+        return None
+    peak_high = max(h[pk:n])
+    if level > peak_high * (1 - B_DROP) or sum(v[n - 20:n]) / 20 < MIN_LIQ:
+        return None
+    tgt = ma_before(c, B_SELL_MA, n)
+    if tgt is None or tgt <= level * 1.02:
+        return None
+    return {"level": level, "tgt": tgt, "close": c[n - 1], "peak": peak_high, "peak_date": rows[pk][0]}
+
+
+def b_resolve(trade, rows):
+    """매수 다음 날부터: 60일선(그날 시작 시점 값)이 매수가보다 위이고 고가가 닿으면 매도, 60일째는 종가"""
+    idx = {r[0]: k for k, r in enumerate(rows)}
+    i = idx.get(trade["date"])
+    if i is None:
+        return None
+    c = [r[3] for r in rows]
+    for j in range(i + 1, min(len(rows), i + B_MAX_HOLD + 1)):
+        tg = ma_before(c, B_SELL_MA, j)
+        if tg is not None and tg > trade["entry"] and rows[j][1] >= tg:
+            return {"result": "60일선 도달", "exit_date": rows[j][0], "exit": max(rows[j][5], tg), "days": j - i, "tgt": tg}
+        if j == i + B_MAX_HOLD:
+            return {"result": "기간만료", "exit_date": rows[j][0], "exit": rows[j][3], "days": B_MAX_HOLD, "tgt": tg}
+    return None
+
+
+def b_today_target(rows):
+    c = [r[3] for r in rows]
+    return ma_before(c, B_SELL_MA, len(rows))
 
 
 # ───────────── 상태 · 기록 ─────────────
@@ -195,6 +297,9 @@ def load_state():
     s.setdefault("alerted", {})
     s.setdefault("open", [])
     s.setdefault("stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.setdefault("b_open", [])
+    s.setdefault("b_alerted", {})
+    s.setdefault("b_stats", {"n": 0, "wins": 0, "sum": 0.0})
     s.pop("active", None)           # 이전 버전 항목 정리
     return s
 
@@ -257,7 +362,7 @@ def run_once(dry=False):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     state = load_state()
     markets = krw_markets()
-    need = set(markets) | {o["m"] for o in state["open"]}
+    need = set(markets) | {o["m"] for o in state["open"]} | {o["m"] for o in state["b_open"]}
     log(f"마켓 {len(markets)}개 조회")
 
     def fetch(m):
@@ -324,13 +429,112 @@ def run_once(dry=False):
                    f"평균 {st['sum'] / st['n'] * 100:+.1f}%") if st["n"] else ""
         send_telegram("가상 매매 결과\n\n" + "\n".join(closed_msgs) + ("\n\n" + summary if summary else ""), dry)
 
+    # 4) 전략 ①
+    b_sig, b_closed = (run_strategy_b(state, markets, data, dry) if B_ON else (0, 0))
+
     # 오래된 기록 정리 + 실행 기록
     cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
     state["alerted"] = {m: d for m, d in state["alerted"].items() if d >= cutoff}
+    state["b_alerted"] = {m: d for m, d in state["b_alerted"].items() if d >= cutoff}
     state["last_run"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     save_state(state)
-    log(f"신호 {len(signals)}개, 청산 {len(closed_msgs)}개, 보유 중 {len(state['open'])}개, "
+    log(f"신호 {len(signals)}개, 청산 {len(closed_msgs)}개, 보유 중 {len(state['open'])}개 | "
+        f"① 체결 {b_sig}개, 청산 {b_closed}개, 보유 중 {len(state['b_open'])}개 | "
         f"조회 실패 {errors}개, {time.monotonic() - t0:.0f}초")
+
+
+def run_strategy_b(state, markets, data, dry):
+    """전략 ①: 가상 청산 → 가상 체결 → 매수 대기 목록. (체결 수, 청산 수) 반환"""
+    first = not state.get("b_init")
+    st = state["b_stats"]
+
+    # 1) 가상 보유 청산
+    closed, still = [], []
+    for o in state["b_open"]:
+        rows, _ = data.get(o["m"], (None, None))
+        res = b_resolve(o, rows) if rows else None
+        if not res:
+            still.append(o)
+            continue
+        r = res["exit"] / o["entry"] * (1 - FEE) ** 2 - 1
+        st["n"] += 1; st["sum"] += r; st["wins"] += 1 if r > 0 else 0
+        append_trade([o["date"], o["m"], o["name"], round(o["entry"], 8), round(res["tgt"], 8) if res["tgt"] else "",
+                      "없음", res["exit_date"], round(res["exit"], 8), "[90일선] " + res["result"],
+                      round(r * 100, 2), res["days"]])
+        icon = "✅" if res["result"] == "60일선 도달" else "⏳"
+        closed.append(f"{icon} {res['result']} · {o['name']} ({o['m'][4:]})\n"
+                      f"   {fmt_price(o['entry'])} → {fmt_price(res['exit'])}원  {r * 100:+.1f}%  ({res['days']}일 보유)")
+    state["b_open"] = still
+
+    # 2) 어제 체결된 신호 + 매수 대기 목록
+    held = {o["m"] for o in state["b_open"]}
+    fills, watch, backfill = [], [], []
+    last_day = None
+    for m, name in markets.items():
+        rows, _ = data.get(m, (None, None))
+        if not rows or len(rows) < B_MIN_AGE:
+            continue
+        sigs, used = b_scan(rows)
+        last_day = last_day or rows[-1][0]
+        if first:   # 처음 실행: 최근 60일 안에 생겨 아직 끝나지 않은 신호를 이어서 기록
+            for s in sigs:
+                if s["valid"] and s["i"] >= len(rows) - B_MAX_HOLD and s["i"] < len(rows) - 1 and m not in held:
+                    o = {"m": m, "name": name, "date": s["date"], "entry": s["entry"], "backfill": True}
+                    if not b_resolve(o, rows):
+                        state["b_open"].append(o); held.add(m); backfill.append(o)
+        s = sigs[-1] if sigs else None
+        if s and s["i"] == len(rows) - 1 and s["valid"] and state["b_alerted"].get(m) != s["date"] and m not in held:
+            state["b_alerted"][m] = s["date"]
+            o = {"m": m, "name": name, "date": s["date"], "entry": s["entry"]}
+            state["b_open"].append(o); held.add(m)
+            fills.append((o, s))
+        if m not in held:
+            w = b_watch(rows, used)
+            if w:
+                watch.append((m, name, w))
+    state["b_init"] = True
+
+    # 3) 알림
+    if fills:
+        lines = [f"🔵 [90일선] 가상 체결 {len(fills)}개 ({fills[0][1]['date'][5:]} 장중 90일선 터치)", ""]
+        for o, s in fills:
+            lines += [f"• {o['name']} ({o['m'][4:]})",
+                      f"   매수가 {fmt_price(o['entry'])}원 (90일선)",
+                      f"   🎯 목표 60일선 {fmt_price(s['tgt'])}원 ({(s['tgt'] / o['entry'] - 1) * 100:+.0f}%, 매일 바뀜)",
+                      f"   급등 고점 {fmt_price(s['peak'])}원 ({s['peak_date'][5:]}) 대비 {(o['entry'] / s['peak'] - 1) * 100:.0f}%",
+                      f"   손절 없음 · 최대 {B_MAX_HOLD}일 보유", ""]
+        send_telegram("\n".join(lines).rstrip(), dry)
+
+    msg = []
+    daily = last_day is not None and state.get("b_daily") != last_day   # 대기·보유 목록은 하루 한 번만
+    if daily:
+        state["b_daily"] = last_day
+    if watch and daily:
+        watch.sort(key=lambda x: x[2]["close"] / x[2]["level"])
+        day = (datetime.strptime(last_day, "%Y-%m-%d") + timedelta(days=1)).strftime("%m/%d") if last_day else "오늘"
+        msg += [f"🔔 [90일선] {day} 매수 대기 {len(watch)}개 (90일선 지정가 → 60일선 목표)", ""]
+        for m, name, w in watch:
+            msg += [f"• {name} ({m[4:]})",
+                    f"   매수 지정가 {fmt_price(w['level'])}원 (현재가 대비 {(w['level'] / w['close'] - 1) * 100:.0f}%)",
+                    f"   🎯 목표 60일선 {fmt_price(w['tgt'])}원 ({(w['tgt'] / w['level'] - 1) * 100:+.0f}%)",
+                    f"   급등 고점 {fmt_price(w['peak'])}원 ({w['peak_date'][5:]}) 대비 {(w['level'] / w['peak'] - 1) * 100:.0f}%", ""]
+    if state["b_open"] and daily:
+        msg += ["📌 [90일선] 가상 보유 중 (오늘 목표가)"]
+        for o in state["b_open"]:
+            rows, _ = data.get(o["m"], (None, None))
+            if not rows:
+                continue
+            tg, cl = b_today_target(rows), rows[-1][3]
+            days = (datetime.strptime(rows[-1][0], "%Y-%m-%d") - datetime.strptime(o["date"], "%Y-%m-%d")).days
+            msg.append(f"• {o['name']} ({o['m'][4:]}) {o['date'][5:]} 매수 {fmt_price(o['entry'])} · 현재 {fmt_price(cl)} "
+                       f"({(cl / o['entry'] - 1) * 100:+.0f}%) · 목표 {fmt_price(tg)} · {days}/{B_MAX_HOLD}일"
+                       + (" · 이전 신호 이어받음" if o.get("backfill") else ""))
+    if closed:
+        msg += ["", "[90일선] 가상 매매 결과", ""] + closed
+        msg.append(f"📊 [90일선] 누적: {st['n']}건 · 승률 {st['wins'] / st['n'] * 100:.0f}% · 평균 {st['sum'] / st['n'] * 100:+.1f}%")
+    if msg:
+        send_telegram("\n".join(msg).strip(), dry)
+    return len(fills), len(closed)
 
 
 def check(market):
@@ -343,6 +547,10 @@ def check(market):
           f"  둘 다 {WR_TH:g} 이하 연속: {ev['run']}일 (기준 {RUN_DAYS}일)\n"
           f"  20일 평균 거래대금: {fmt_won(ev['liq'])}\n"
           f"  오늘 신호: {'있음' if ev['signal'] else '없음'}")
+    sigs, used = b_scan(rows)
+    w = b_watch(rows, used)
+    print(f"[90일선 전략] 창 안 신호: " + (", ".join(f"{s['date']} {fmt_price(s['entry'])}{'' if s['valid'] else '(목표 미달)'}" for s in sigs) or "없음"))
+    print(f"  오늘 매수 대기: " + (f"지정가 {fmt_price(w['level'])} → 목표 {fmt_price(w['tgt'])}" if w else "아님"))
 
 
 def main():
