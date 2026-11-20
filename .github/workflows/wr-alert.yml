@@ -2,14 +2,15 @@ name: wr-alert
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분 밀릴 수 있음)
-  workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+    - cron: "5 15 * * *"    # 매일 00:05 (한국시간) — 일봉 마감 직후 확인
+    - cron: "40 15 * * *"   # 00:40 한 번 더 (GitHub 실행 지연·누락 대비, 중복 알림 없음)
+  workflow_dispatch:         # Actions 탭에서 수동 실행
 
 permissions:
-  contents: write            # 중복 알림 방지용 상태 파일 저장
+  contents: write            # 알림·가상 매매 기록 저장
 
 concurrency:
-  group: wr-alert            # 실행이 겹치지 않게
+  group: wr-alert
   cancel-in-progress: false
 
 jobs:
@@ -19,17 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: WR 감시 1회 실행
+      - name: 신호 확인 + 가상 매매 결과 업데이트
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          STATE_FILE: wr_state.json
-        run: python3 wr_alert.py --once
+        run: python3 wr_alert.py
 
-      - name: 상태 파일 저장 (바뀌었을 때만)
+      - name: 기록 저장 (바뀌었을 때만)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [ -f wr_state.json ] || exit 0
-          git add wr_state.json
+          for f in wr_state.json trades.csv; do [ -f "$f" ] && git add "$f"; done
           git diff --cached --quiet || (git commit -m "update state" && git push)
