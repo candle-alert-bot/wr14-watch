@@ -419,7 +419,7 @@
   "KRW-META2": false,
   "KRW-ZAMA": false,
   "KRW-GWEI": true,
-  "KRW-SKR": false,
+  "KRW-SKR": true,
   "KRW-UP": true,
   "KRW-LIT": true,
   "KRW-Q": false,
@@ -830,6 +830,7 @@
   "KRW-HPP": "2026-11-21",
   "KRW-QUID": "2026-11-21",
   "KRW-BANK": "2026-11-21",
-  "KRW-TRB": "2026-11-21"
+  "KRW-TRB": "2026-11-21",
+  "KRW-SKR": "2026-11-21"
  }
 }
