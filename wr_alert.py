@@ -36,6 +36,10 @@
   백테스트(빗썸 2020~2026) 82건 · 승률 93% · 평균 +7.4%
   장중(--intraday, 매시간): 지정가 체결, +10% 도달을 바로 알림
 
+[주봉·일봉 WR(14) 하위 목록 (WR_BOTTOM_N, 기본 10개)]
+  매일 자정 직후 한 번, 20일 평균 거래대금 1억 이상 코인 중 주봉·일봉 WR이 둘 다 낮은 순서
+  (둘 중 높은 값 기준)로 하위 10개를 알림. 둘 다 -95 이하면 ★ 표시
+
 [일목 기준선 매도 알림 (KIJUN_WATCH 코인, 기본 KRW-HUMA)]
   기준선 = 최근 26일(오늘 포함) 최고가와 최저가의 중간
   매일 자정 직후 오늘의 기준선(매도 지정가)과 앞으로 바뀔 날짜를 알리고, 장중 고가가 닿으면 바로 알림
@@ -87,6 +91,7 @@ C_ON = os.getenv("WICK_STRATEGY", "1") != "0"
 C_TP, C_HOLD = 0.15, 14
 C_MAX_LIQ = 5e8
 KIJUN_WATCH = [m.strip().upper() for m in os.getenv("KIJUN_WATCH", "KRW-HUMA").split(",") if m.strip()]
+WR_BOTTOM_N = int(os.getenv("WR_BOTTOM_N", "10"))   # 매일 자정 주봉·일봉 WR 하위 목록 개수 (0이면 끔)
 C_NOTE = "백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2% · 평균 7.6일 보유"
 # 전략 ③ 거래절벽 급락 반등
 D_ON = os.getenv("CLIFF_STRATEGY", "1") != "0"
@@ -714,6 +719,40 @@ def kijun_plan(rows, days=14):
     return out
 
 
+def wr_bottom(markets, data, n=WR_BOTTOM_N):
+    """주봉·일봉 WR(14) 둘 다 낮은 순 (둘 중 높은 값 기준) 하위 n개. 20일 평균 거래대금 1억 이상만"""
+    out = []
+    for m, name in markets.items():
+        rows, _ = data.get(m, (None, None))
+        if not rows or len(rows) < 120:
+            continue
+        t, h, l, c, wr_d, wr_w, liq = indicators(rows)
+        wd, ww = wr_d[-1], wr_w[-1]
+        if wd is None or ww is None or liq[-1] < MIN_LIQ:
+            continue
+        out.append({"m": m, "name": name, "date": t[-1], "wd": wd, "ww": ww, "close": c[-1], "liq": liq[-1]})
+    out.sort(key=lambda x: (max(x["wd"], x["ww"]), x["wd"] + x["ww"]))
+    return out[:n]
+
+
+def run_wr_bottom(state, markets, data, dry):
+    """매일 자정 한 번: 주봉·일봉 WR(14) 하위 목록"""
+    if WR_BOTTOM_N <= 0:
+        return 0
+    lst = wr_bottom(markets, data)
+    if not lst or state.get("w_daily") == lst[0]["date"]:
+        return 0
+    state["w_daily"] = lst[0]["date"]
+    lines = [f"📉 [WR 하위 {len(lst)}] {lst[0]['date'][5:]} 마감 기준 (주봉·일봉 WR(14) 둘 다 낮은 순)", ""]
+    for k, x in enumerate(lst, 1):
+        star = " ★" if x["ww"] <= -95 and x["wd"] <= -95 else ""
+        lines.append(f"{k}. {x['name']} ({x['m'][4:]}) 주 {x['ww']:.1f} / 일 {x['wd']:.1f}{star}\n"
+                     f"   종가 {fmt_price(x['close'])}원 · 거래대금 {fmt_won(x['liq'])}/일")
+    lines += ["", "★ 둘 다 -95 이하 · 20일 평균 거래대금 1억 이상 코인만 · 매수 신호가 아니라 목록이에요"]
+    send_telegram("\n".join(lines), dry)
+    return len(lst)
+
+
 def run_kijun(state, markets, data, dry):
     lines = []
     for m in KIJUN_WATCH:
@@ -939,6 +978,9 @@ def run_once(dry=False):
 
     # 5) 일목 기준선 매도 알림
     run_kijun(state, markets, data, dry)
+
+    # 6) 주봉·일봉 WR 하위 목록
+    run_wr_bottom(state, markets, data, dry)
 
     # 오래된 기록 정리 + 실행 기록
     cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
