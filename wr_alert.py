@@ -2,7 +2,7 @@
 """
 빗썸 KRW 코인 '과매도 반등' 신호 알림 + 가상 매매 기록 봇
 
-[매수 신호]
+[기본 전략 — 꺼져 있음. 켜려면 환경변수 WR_STRATEGY=1]
   주봉 WR(14)과 일봉 WR(14)이 둘 다 -85 이하인 날이 14일 이상 이어진 뒤,
   처음으로 일봉이 상승 마감(전일 종가보다 높게 마감)한 날
   + 최근 20일 평균 하루 거래대금 1억원 이상
@@ -53,6 +53,7 @@ FEE = 0.001                                        # 가상 결과 계산용 수
 PERIOD = 14
 CANDLES = 200
 # 전략 ① 급락 코인 90일선 → 60일선
+A_ON = os.getenv("WR_STRATEGY", "0") == "1"     # 기본 WR 전략 (백테스트 성적이 약해 기본값 꺼짐)
 B_ON = os.getenv("MA_STRATEGY", "1") != "0"
 B_BUY_MA, B_SELL_MA = 90, 60
 B_PUMP = 2.0          # 30일 저점 대비 고가 배수 (2배 = +100%)
@@ -411,7 +412,7 @@ def run_once(dry=False):
 
     # 2) 새 매수 신호
     signals = []
-    for m, name in markets.items():
+    for m, name in (markets.items() if A_ON else []):
         rows, err = data.get(m, (None, None))
         if not rows or len(rows) < 120:
             continue
