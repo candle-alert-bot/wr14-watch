@@ -27,6 +27,10 @@
   → 그날 종가에 매수, +15%에 지정가 매도, 14일 안에 안 닿으면 14일째 종가에 매도
   백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2%
 
+[일목 기준선 매도 알림 (KIJUN_WATCH 코인, 기본 KRW-HUMA)]
+  기준선 = 최근 26일(오늘 포함) 최고가와 최저가의 중간
+  매일 자정 직후 오늘의 기준선(매도 지정가)과 앞으로 바뀔 날짜를 알리고, 장중 고가가 닿으면 바로 알림
+
 백테스트(빗썸 2020 ~ 2026-11)에서 고른 조건이며, 미래 수익을 보장하지 않습니다.
 외부 패키지 없이 파이썬 표준 라이브러리만 사용 (Python 3.9+)
 
@@ -73,6 +77,7 @@ B_MIN_AGE = 125       # 상장 후 최소 일수
 C_ON = os.getenv("WICK_STRATEGY", "1") != "0"
 C_TP, C_HOLD = 0.15, 14
 C_MAX_LIQ = 5e8
+KIJUN_WATCH = [m.strip().upper() for m in os.getenv("KIJUN_WATCH", "KRW-HUMA").split(",") if m.strip()]
 C_NOTE = "백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2% · 평균 7.6일 보유"
 EXCLUDE = {"USDT", "USDC", "USDE", "USDS", "USD1", "USDG", "DAI", "PAXG", "XAUT", "FDUSD", "PYUSD", "TUSD"}
 
@@ -451,6 +456,80 @@ def run_strategy_c(state, markets, data, dry):
     return len(sigs_new), len(closed)
 
 
+# ───────────── 일목 기준선 매도 알림 ─────────────
+def kijun(highs, lows):
+    return (max(highs) + min(lows)) / 2
+
+
+def kijun_plan(rows, days=14):
+    """마감된 일봉으로 오늘과 이후 기준선 (새 고점·저점이 안 나온다고 가정). [(날짜, 값)]"""
+    H = [r[1] for r in rows]; L = [r[2] for r in rows]
+    d0 = datetime.strptime(rows[-1][0], "%Y-%m-%d")
+    out = []
+    for k in range(0, days + 1):          # k=0: 오늘(마지막 마감일 다음 날), 창 = 마감된 최근 25-k일
+        n = 25 - k
+        if n <= 0:
+            break
+        out.append(((d0 + timedelta(days=k + 1)).strftime("%Y-%m-%d"), kijun(H[-n:], L[-n:])))
+    return out
+
+
+def run_kijun(state, markets, data, dry):
+    lines = []
+    for m in KIJUN_WATCH:
+        rows, _ = data.get(m, (None, None))
+        if not rows or len(rows) < 26:
+            continue
+        plan = kijun_plan(rows)
+        day, kj = plan[0]
+        if state["k_daily"].get(m) == day:
+            continue
+        state["k_daily"][m] = day
+        prev = kijun([r[1] for r in rows[-26:]], [r[2] for r in rows[-26:]])
+        cl = rows[-1][3]
+        steps, last = [], kj
+        for dte, val in plan[1:]:
+            if abs(val / last - 1) >= 0.005:
+                steps.append(f"{dte[5:]} {fmt_price(val)}")
+                last = val
+            if len(steps) >= 5:
+                break
+        name = markets.get(m, m[4:])
+        lines += [f"📍 [기준선 매도] {name} ({m[4:]}) · {day[5:]}",
+                  f"   오늘 기준선 {fmt_price(kj)}원 (어제 {fmt_price(prev)}원, {(kj / prev - 1) * 100:+.1f}%)",
+                  f"   어제 종가 {fmt_price(cl)}원 → 기준선까지 {(kj / cl - 1) * 100:+.0f}%",
+                  "   다음 계단(새 고점·저점 없을 때): " + (" · ".join(steps) if steps else "당분간 그대로"), ""]
+    if lines:
+        send_telegram("\n".join(lines).strip(), dry)
+
+
+def check_kijun_intraday(today, rt, dry):
+    """장중: 오늘 고가가 기준선(오늘 봉 포함 26일)에 닿으면 하루 한 번 알림. 보낸 수 반환"""
+    msgs = []
+    for m in KIJUN_WATCH:
+        if rt.get("kj:" + m) == today:
+            continue
+        try:
+            data = api_get("/candles/days", {"market": m, "count": 30})
+        except Exception as e:
+            log(f"기준선 조회 실패 {m}: {e}")
+            continue
+        days = sorted(data, key=lambda x: x["candle_date_time_kst"])
+        closed = [x for x in days if x["candle_date_time_kst"][:10] < today][-25:]
+        td = [x for x in days if x["candle_date_time_kst"][:10] == today]
+        if not td or len(closed) < 25:
+            continue
+        t0 = td[0]
+        kj = kijun([float(x["high_price"]) for x in closed] + [float(t0["high_price"])],
+                   [float(x["low_price"]) for x in closed] + [float(t0["low_price"])])
+        if float(t0["high_price"]) >= kj:
+            rt["kj:" + m] = today
+            msgs.append(f"• {m[4:]} 오늘 고가 {fmt_price(float(t0['high_price']))}원 ≥ 기준선 {fmt_price(kj)}원 · 지금 {fmt_price(float(t0['trade_price']))}원")
+    if msgs:
+        send_telegram("🔔 [기준선 도달] 매도 기준 가격에 닿았어요\n\n" + "\n".join(msgs), dry)
+    return len(msgs)
+
+
 # ───────────── 상태 · 기록 ─────────────
 def load_state():
     try:
@@ -468,6 +547,7 @@ def load_state():
     s.setdefault("c_open", [])
     s.setdefault("c_alerted", {})
     s.setdefault("c_stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.setdefault("k_daily", {})
     s.setdefault("b_rt", {})          # 장중 알림 보낸 기록 {"fill:KRW-X": 날짜, "tp:KRW-X": 날짜}
     s.pop("active", None)           # 이전 버전 항목 정리
     s["b_open"] = [o for o in s["b_open"] if not o.get("backfill")]   # 이어받은 과거 신호는 기록하지 않음
@@ -608,6 +688,9 @@ def run_once(dry=False):
     # 4) 전략 ①
     b_sig, b_closed = (run_strategy_b(state, markets, data, dry) if B_ON else (0, 0))
 
+    # 5) 일목 기준선 매도 알림
+    run_kijun(state, markets, data, dry)
+
     # 오래된 기록 정리 + 실행 기록
     cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
     state["alerted"] = {m: d for m, d in state["alerted"].items() if d >= cutoff}
@@ -742,8 +825,11 @@ def run_intraday(dry=False):
     held_c = [o for o in state["c_open"] if o["date"] < today and rt.get("tp2:" + o["m"]) != today
               and (today_dt - datetime.strptime(o["date"], "%Y-%m-%d")).days <= C_HOLD]
     need = sorted(set(watch) | {o["m"] for o in held} | {o["m"] for o in held_c})
+    kj_sent = check_kijun_intraday(today, rt, dry)
     if not need:
-        log("장중 확인할 코인 없음")
+        if kj_sent:
+            save_state(state)
+        log(f"장중 확인할 코인 없음 · 기준선 알림 {kj_sent}개")
         return
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         cand = dict(zip(need, ex.map(lambda m: _safe(today_candle, m, today), need)))
