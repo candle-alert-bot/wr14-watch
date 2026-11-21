@@ -423,8 +423,21 @@ def run_strategy_c(state, markets, data, dry):
                  f"<b>{e(C_NOTE)}</b>", ""]
         for o, s in sigs_new:
             exp = (datetime.strptime(o["date"], "%Y-%m-%d") + timedelta(days=C_HOLD)).strftime("%m/%d")
+            try:
+                now = float(api_get("/ticker", {"markets": o["m"]})[0]["trade_price"])
+            except Exception as ex:
+                log(f"현재가 조회 실패 {o['m']}: {ex}")
+                now = None
+            if now is None:
+                now_line = "   📈 지금가: 조회 실패 · 빗썸에서 직접 확인"
+            else:
+                chg = now / o["entry"] - 1
+                jumped = chg > 0.05 or now >= o["entry"] * (1 + C_TP)
+                now_line = (f"   📈 지금 {fmt_price(now)}원 (종가 대비 {chg * 100:+.1f}%)"
+                            + (" · <b>⚠️ 이미 튐 · 건너뛰기 권장</b>" if jumped else ""))
             lines += [f"🔥 <b>{e(o['name'])} ({e(o['m'][4:])})</b>",
                       f"   💰 매수가 <b>{fmt_price(o['entry'])}원</b> ({o['date'][5:]} 종가 · 지금 매수)",
+                      now_line,
                       f"   🎯 매도 지정가 <b>{fmt_price(o['entry'] * (1 + C_TP))}원 (+15%)</b> · 매수 직후 걸어두기",
                       f"   ⏳ {exp}까지 안 닿으면 그날 종가에 정리 · 손절 없음",
                       "   ⚖️ 권장 비중: <b>자산의 1/3</b> (백테스트 기준)",
