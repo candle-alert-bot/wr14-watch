@@ -7,18 +7,7 @@
   "sum": 0.0
  },
  "last_run": "2026-11-21 07:11",
- "b_open": [
-  {
-   "m": "KRW-RLC",
-   "name": "아이젝",
-   "date": "2026-10-31",
-   "entry": 582.7777777777778,
-   "backfill": true,
-   "tgt_prev": null,
-   "tgt_today": 720.5166666666667,
-   "day": "2026-11-21"
-  }
- ],
+ "b_open": [],
  "b_alerted": {},
  "b_stats": {
   "n": 0,
@@ -35,5 +24,12 @@
    "day": "2026-11-21"
   }
  },
- "b_rt": {}
+ "b_rt": {},
+ "c_open": [],
+ "c_alerted": {},
+ "c_stats": {
+  "n": 0,
+  "wins": 0,
+  "sum": 0.0
+ }
 }
