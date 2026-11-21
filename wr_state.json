@@ -31,5 +31,15 @@
   "n": 0,
   "wins": 0,
   "sum": 0.0
- }
+ },
+ "d_wait": [],
+ "d_open": [],
+ "d_alerted": {},
+ "d_last": {},
+ "d_stats": {
+  "n": 0,
+  "wins": 0,
+  "sum": 0.0
+ },
+ "k_daily": {}
 }
