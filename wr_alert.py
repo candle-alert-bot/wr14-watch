@@ -27,6 +27,15 @@
   → 그날 종가에 매수, +15%에 지정가 매도, 14일 안에 안 닿으면 14일째 종가에 매도
   백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2%
 
+[전략 ③ 거래절벽 급락 반등 (가상 기록)]
+  종가가 7일선보다 17% 이상 아래 + 최근 3일 평균 거래대금이 20일 평균의 30% 이하
+  + 7일 수익률 -10% 이하 + 상장 120일 이상, 20일 평균 거래대금 1억 이상
+  → 다음 2일 동안 신호일 종가 -5% 지정가 매수 (안 닿으면 취소)
+  → 체결가 +10% 지정가 매도 (체결 다음 날부터), 14일 안에 안 닿으면 14일째 종가에 매도, 손절 없음
+  같은 코인은 체결된 신호일부터 14일 동안 새 신호를 받지 않음
+  백테스트(빗썸 2020~2026) 82건 · 승률 93% · 평균 +7.4%
+  장중(--intraday, 매시간): 지정가 체결, +10% 도달을 바로 알림
+
 [일목 기준선 매도 알림 (KIJUN_WATCH 코인, 기본 KRW-HUMA)]
   기준선 = 최근 26일(오늘 포함) 최고가와 최저가의 중간
   매일 자정 직후 오늘의 기준선(매도 지정가)과 앞으로 바뀔 날짜를 알리고, 장중 고가가 닿으면 바로 알림
@@ -38,7 +47,7 @@
   python3 wr_alert.py                 # 신호 확인 + 가상 매매 결과 업데이트 (하루 1번, 자정 직후 실행)
   python3 wr_alert.py --dry-run       # 텔레그램 대신 화면 출력
   python3 wr_alert.py --check KRW-BTC # 특정 코인의 현재 상태 확인
-  python3 wr_alert.py --intraday      # 장중 확인 (90일선 전략 지정가 체결·목표 도달)
+  python3 wr_alert.py --intraday      # 장중 확인 (지정가 체결·목표 도달·기준선 도달)
 """
 import argparse
 import csv
@@ -79,6 +88,13 @@ C_TP, C_HOLD = 0.15, 14
 C_MAX_LIQ = 5e8
 KIJUN_WATCH = [m.strip().upper() for m in os.getenv("KIJUN_WATCH", "KRW-HUMA").split(",") if m.strip()]
 C_NOTE = "백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2% · 평균 7.6일 보유"
+# 전략 ③ 거래절벽 급락 반등
+D_ON = os.getenv("CLIFF_STRATEGY", "1") != "0"
+D_RATIO7, D_VOL3, D_RET7 = 0.83, 0.30, -0.10   # 7일선 대비 종가, 3일 거래대금/20일 평균, 7일 수익률
+D_DIP, D_WAIT = 0.05, 2       # 신호일 종가 -5% 지정가, 다음 2일 동안
+D_TP, D_HOLD, D_COOL = 0.10, 14, 14
+D_MIN_AGE = 120
+D_NOTE = "백테스트(빗썸 2020~2026) 82건 · 승률 93% · 평균 +7.4% · 보유 중앙값 1일"
 EXCLUDE = {"USDT", "USDC", "USDE", "USDS", "USD1", "USDG", "DAI", "PAXG", "XAUT", "FDUSD", "PYUSD", "TUSD"}
 
 # ───────────── 실행 설정 ─────────────
@@ -469,6 +485,217 @@ def run_strategy_c(state, markets, data, dry):
     return len(sigs_new), len(closed)
 
 
+# ───────────── 전략 ③: 거래절벽 급락 반등 ─────────────
+def _days(a, b):
+    """날짜 문자열 b - a (일)"""
+    return (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+
+
+def _shift(d, k):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=k)).strftime("%Y-%m-%d")
+
+
+def d_signal(rows, i):
+    """i일 종가 기준 ③ 신호 조건. 맞으면 지표, 아니면 None"""
+    if i < D_MIN_AGE or i >= len(rows):
+        return None
+    c = [r[3] for r in rows[i - 20:i + 1]]
+    v = [r[4] for r in rows[i - 20:i + 1]]
+    v20 = sum(v[0:20]) / 20
+    if v20 < MIN_LIQ:
+        return None
+    ratio = c[20] / ma_incl(c, 7, 20)
+    if not ratio <= D_RATIO7:
+        return None
+    vol3 = (v[20] + v[19] + v[18]) / 3 / v20
+    if not vol3 <= D_VOL3:
+        return None
+    ret7 = c[20] / c[13] - 1
+    if not ret7 <= D_RET7:
+        return None
+    return {"date": rows[i][0], "close": c[20], "lim": c[20] * (1 - D_DIP), "ratio": ratio, "vol3": vol3,
+            "ret7": ret7, "liq": v20}
+
+
+def d_fill(p, rows, idx=None):
+    """지정가 대기 p의 상태: ("fill", 체결일, 체결가) / ("expired",) / ("wait",) / None(날짜 없음)"""
+    idx = idx or {r[0]: k for k, r in enumerate(rows)}
+    i = idx.get(p["date"])
+    if i is None:
+        return None
+    for k in range(1, D_WAIT + 1):
+        j = i + k
+        if j >= len(rows):
+            return ("wait",)
+        if rows[j][2] <= p["lim"]:
+            return ("fill", rows[j][0], min(rows[j][5], p["lim"]))
+    return ("expired",)
+
+
+def d_resolve(o, rows, idx=None):
+    """체결 다음 날부터 14일: 고가가 +10%에 닿으면 +10%, 아니면 14일째 종가"""
+    idx = idx or {r[0]: k for k, r in enumerate(rows)}
+    i = idx.get(o["fill_date"])
+    if i is None:
+        return None
+    tp = o["entry"] * (1 + D_TP)
+    for k in range(1, D_HOLD + 1):
+        j = i + k
+        if j >= len(rows):
+            return None
+        if rows[j][1] >= tp:
+            return {"result": "+10% 도달", "exit_date": rows[j][0], "exit": tp, "days": k}
+        if k == D_HOLD:
+            return {"result": "14일 만료", "exit_date": rows[j][0], "exit": rows[j][3], "days": k}
+    return None
+
+
+def d_backtest(rows):
+    """전체 기간을 백테스트와 같은 규칙으로 훑어 거래 목록 반환 (검증·--check용)"""
+    out, ld = [], None
+    idx = {r[0]: k for k, r in enumerate(rows)}
+    for i in range(D_MIN_AGE, len(rows)):
+        s = d_signal(rows, i)
+        if not s or (ld and _days(ld, s["date"]) < D_COOL):
+            continue
+        f = d_fill(s, rows, idx)
+        if f[0] != "fill":
+            continue
+        ld = s["date"]
+        o = {"date": s["date"], "fill_date": f[1], "entry": f[2]}
+        res = d_resolve(o, rows, idx)
+        if res:
+            o.update(res)
+            o["r"] = res["exit"] / o["entry"] * (1 - FEE) ** 2 - 1
+            out.append(o)
+    return out
+
+
+def run_strategy_d(state, markets, data, dry):
+    """전략 ③: 지정가 대기 처리 → 가상 청산 → 새 신호. (신호 수, 체결 수, 청산 수) 반환"""
+    st, last, rt = state["d_stats"], state["d_last"], state["b_rt"]
+    e = html.escape
+
+    # 1) 지정가 대기: 체결·취소 (신호일 순서대로, 체결되면 같은 코인 14일 안 신호는 취소)
+    fills, expired, waiting = [], [], []
+    ref = max((rows[-1][0] for rows, _ in data.values() if rows), default=None)
+    for p in sorted(state["d_wait"], key=lambda x: x["date"]):
+        if last.get(p["m"]) and _days(last[p["m"]], p["date"]) < D_COOL:
+            continue
+        rows, _ = data.get(p["m"], (None, None))
+        f = d_fill(p, rows) if rows else None
+        if not f or f[0] == "wait":
+            if ref and _days(p["date"], ref) > D_WAIT + 5:   # 거래 중단 등으로 일봉이 안 들어오는 코인
+                continue
+            waiting.append(p)
+        elif f[0] == "expired":
+            expired.append(p)
+        else:
+            last[p["m"]] = p["date"]
+            o = {"m": p["m"], "name": p["name"], "date": p["date"], "lim": p["lim"], "fill_date": f[1], "entry": f[2]}
+            state["d_open"].append(o)
+            if rt.get(f"fill3:{p['m']}:{p['date']}") != f[1]:
+                fills.append(o)
+    state["d_wait"] = waiting
+
+    # 2) 가상 보유 청산
+    closed, still = [], []
+    for o in state["d_open"]:
+        rows, _ = data.get(o["m"], (None, None))
+        res = d_resolve(o, rows) if rows else None
+        if not res:
+            still.append(o)
+            continue
+        r = res["exit"] / o["entry"] * (1 - FEE) ** 2 - 1
+        st["n"] += 1; st["sum"] += r; st["wins"] += 1 if r > 0 else 0
+        append_trade([o["date"], o["m"], o["name"], round(o["entry"], 8), round(o["entry"] * (1 + D_TP), 8), "없음",
+                      res["exit_date"], round(res["exit"], 8), "[거래절벽] " + res["result"], round(r * 100, 2), res["days"]])
+        icon = "✅" if r > 0 else "🔻"
+        closed.append(f"{icon} {res['result']} · {o['name']} ({o['m'][4:]})\n"
+                      f"   {fmt_price(o['entry'])} → {fmt_price(res['exit'])}원  {r * 100:+.1f}%  ({res['days']}일 보유)")
+    state["d_open"] = still
+
+    # 3) 새 신호 (어제 마감 일봉)
+    sigs, last_day = [], None
+    for m, name in markets.items():
+        rows, _ = data.get(m, (None, None))
+        if not rows or len(rows) <= D_MIN_AGE:
+            continue
+        last_day = last_day or rows[-1][0]
+        s = d_signal(rows, len(rows) - 1)
+        if not s or state["d_alerted"].get(m) == s["date"]:
+            continue
+        if last.get(m) and _days(last[m], s["date"]) < D_COOL:
+            continue
+        state["d_alerted"][m] = s["date"]
+        prev = [p for p in state["d_wait"] if p["m"] == m]
+        p = {"m": m, "name": name, "date": s["date"], "close": s["close"], "lim": s["lim"]}
+        state["d_wait"].append(p)
+        sigs.append((p, s, prev))
+
+    # 4) 알림
+    if sigs:
+        lines = ["🚨🚨 <b>매수 지정가 신호</b> 🚨🚨",
+                 f"<b>[거래절벽 급락 반등] {len(sigs)}개</b>",
+                 f"<b>{e(D_NOTE)}</b>", ""]
+        for p, s, prev in sigs:
+            until = _shift(p["date"], D_WAIT)[5:].replace("-", "/")
+            try:
+                now = float(api_get("/ticker", {"markets": p["m"]})[0]["trade_price"])
+            except Exception as ex:
+                log(f"현재가 조회 실패 {p['m']}: {ex}")
+                now = None
+            if now is None:
+                now_line = "   📈 지금가: 조회 실패 · 빗썸에서 직접 확인"
+            else:
+                now_line = (f"   📈 지금 {fmt_price(now)}원 (종가 대비 {(now / p['close'] - 1) * 100:+.1f}%)"
+                            + (" · <b>이미 지정가 아래 · 바로 체결</b>" if now <= p["lim"] else ""))
+            lines += [f"🔥 <b>{e(p['name'])} ({e(p['m'][4:])})</b>",
+                      f"   🛒 매수 지정가 <b>{fmt_price(p['lim'])}원</b> ({p['date'][5:]} 종가 {fmt_price(p['close'])}원 -5%)",
+                      f"   ⏳ {until} 밤 12시까지 유효 · 안 닿으면 취소",
+                      now_line,
+                      f"   🎯 체결되면 바로 매도 지정가 = 매수가 +10% (지정가로 사면 <b>{fmt_price(p['lim'] * (1 + D_TP))}원</b>)",
+                      f"   ⏳ 체결 후 {D_HOLD}일 안에 안 닿으면 그날 종가에 정리 · 손절 없음",
+                      "   ⚖️ 권장 비중: <b>자산의 1/3</b> (백테스트 기준)",
+                      f"   7일선 대비 {(s['ratio'] - 1) * 100:.0f}% · 3일 거래대금 {s['vol3'] * 100:.0f}% (20일 평균 대비)"
+                      f" · 7일 {s['ret7'] * 100:.0f}% · 거래대금 {fmt_won(s['liq'])}/일"]
+            if prev:
+                lines.append(f"   (이전 신호 지정가 {fmt_price(prev[-1]['lim'])}원도 대기 중 · 먼저 닿는 쪽 하나만)")
+            lines.append("")
+        lines.append("⚠️ 승률 93%는 과거 기록이에요. 진 거래는 평균 -21%였어요(최악 -42%).")
+        send_telegram("\n".join(lines).strip(), dry, as_html=True)
+
+    msg = []
+    if fills:
+        msg += [f"🟣 [거래절벽] 가상 체결 {len(fills)}개", ""]
+        for o in fills:
+            msg += [f"• {o['name']} ({o['m'][4:]}) {o['fill_date'][5:]} 매수 {fmt_price(o['entry'])}원",
+                    f"   🎯 매도 지정가 {fmt_price(o['entry'] * (1 + D_TP))}원 (+10%) · {_shift(o['fill_date'], D_HOLD)[5:]}까지", ""]
+    if expired:
+        msg.append("⌛ [거래절벽] 미체결 취소: " + ", ".join(f"{p['name']}({fmt_price(p['lim'])}원)" for p in expired))
+    daily = last_day is not None and state.get("d_daily") != last_day
+    if daily:
+        state["d_daily"] = last_day
+    old_wait = [p for p in state["d_wait"] if p["date"] != last_day]
+    if daily and (old_wait or state["d_open"]):
+        msg += ["", "📌 [거래절벽] 현황"]
+        for p in old_wait:
+            msg.append(f"• 대기 {p['name']} ({p['m'][4:]}) 매수 지정가 {fmt_price(p['lim'])} · {_shift(p['date'], D_WAIT)[5:]}까지")
+        for o in state["d_open"]:
+            rows, _ = data.get(o["m"], (None, None))
+            if not rows:
+                continue
+            cl, left = rows[-1][3], D_HOLD - _days(o["fill_date"], rows[-1][0])
+            msg.append(f"• 보유 {o['name']} ({o['m'][4:]}) {o['fill_date'][5:]} 매수 {fmt_price(o['entry'])} · 목표 {fmt_price(o['entry'] * (1 + D_TP))}"
+                       f" · 어제 종가 {fmt_price(cl)} ({(cl / o['entry'] - 1) * 100:+.0f}%) · 남은 {left}일")
+    if closed:
+        msg += ["", "[거래절벽] 가상 매매 결과", ""] + closed
+        msg.append(f"📊 [거래절벽] 누적: {st['n']}건 · 승률 {st['wins'] / st['n'] * 100:.0f}% · 평균 {st['sum'] / st['n'] * 100:+.1f}%")
+    if msg:
+        send_telegram("\n".join(msg).strip(), dry)
+    return len(sigs), len(fills), len(closed)
+
+
 # ───────────── 일목 기준선 매도 알림 ─────────────
 def kijun(highs, lows):
     return (max(highs) + min(lows)) / 2
@@ -560,6 +787,11 @@ def load_state():
     s.setdefault("c_open", [])
     s.setdefault("c_alerted", {})
     s.setdefault("c_stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.setdefault("d_wait", [])       # ③ 지정가 대기
+    s.setdefault("d_open", [])
+    s.setdefault("d_alerted", {})
+    s.setdefault("d_last", {})       # ③ 코인별 마지막 체결 신호일
+    s.setdefault("d_stats", {"n": 0, "wins": 0, "sum": 0.0})
     s.setdefault("k_daily", {})
     s.setdefault("b_rt", {})          # 장중 알림 보낸 기록 {"fill:KRW-X": 날짜, "tp:KRW-X": 날짜}
     s.pop("active", None)           # 이전 버전 항목 정리
@@ -628,7 +860,8 @@ def run_once(dry=False):
     today = datetime.now(KST).strftime("%Y-%m-%d")
     state = load_state()
     markets = krw_markets()
-    need = set(markets) | {o["m"] for o in state["open"]} | {o["m"] for o in state["b_open"]} | {o["m"] for o in state["c_open"]}
+    need = (set(markets) | {o["m"] for o in state["open"]} | {o["m"] for o in state["b_open"]} | {o["m"] for o in state["c_open"]}
+            | {o["m"] for o in state["d_open"]} | {p["m"] for p in state["d_wait"]})
     log(f"마켓 {len(markets)}개 조회")
 
     def fetch(m):
@@ -679,6 +912,9 @@ def run_once(dry=False):
     # 0) 전략 ② (가장 먼저 · 가장 강조)
     c_sig, c_closed = (run_strategy_c(state, markets, data, dry) if C_ON else (0, 0))
 
+    # 0-2) 전략 ③
+    d_sig, d_fill_n, d_closed = (run_strategy_d(state, markets, data, dry) if D_ON else (0, 0, 0))
+
     # 3) 알림
     if signals:
         lines = [f"🟢 매수 신호 {len(signals)}개 (주봉·일봉 WR ≤ {WR_TH:g} {RUN_DAYS}일↑ 후 첫 상승 마감)", ""]
@@ -709,11 +945,14 @@ def run_once(dry=False):
     state["alerted"] = {m: d for m, d in state["alerted"].items() if d >= cutoff}
     state["b_alerted"] = {m: d for m, d in state["b_alerted"].items() if d >= cutoff}
     state["c_alerted"] = {m: d for m, d in state["c_alerted"].items() if d >= cutoff}
+    state["d_alerted"] = {m: d for m, d in state["d_alerted"].items() if d >= cutoff}
+    state["d_last"] = {m: d for m, d in state["d_last"].items() if d >= cutoff}
     state["last_run"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     save_state(state)
     log(f"신호 {len(signals)}개, 청산 {len(closed_msgs)}개, 보유 중 {len(state['open'])}개 | "
         f"① 체결 {b_sig}개, 청산 {b_closed}개, 보유 중 {len(state['b_open'])}개 | "
         f"② 신호 {c_sig}개, 청산 {c_closed}개, 보유 중 {len(state['c_open'])}개 | "
+        f"③ 신호 {d_sig}개, 체결 {d_fill_n}개, 청산 {d_closed}개, 대기 {len(state['d_wait'])}개, 보유 중 {len(state['d_open'])}개 | "
         f"조회 실패 {errors}개, {time.monotonic() - t0:.0f}초")
 
 
@@ -837,7 +1076,15 @@ def run_intraday(dry=False):
     today_dt = datetime.strptime(today, "%Y-%m-%d")
     held_c = [o for o in state["c_open"] if o["date"] < today and rt.get("tp2:" + o["m"]) != today
               and (today_dt - datetime.strptime(o["date"], "%Y-%m-%d")).days <= C_HOLD]
-    need = sorted(set(watch) | {o["m"] for o in held} | {o["m"] for o in held_c})
+    wait_d = [p for p in state["d_wait"] if 1 <= _days(p["date"], today) <= D_WAIT
+              and f"fill3:{p['m']}:{p['date']}" not in rt
+              and not (state["d_last"].get(p["m"]) and _days(state["d_last"][p["m"]], p["date"]) < D_COOL)]
+    filled_m = {p["m"] for p in state["d_wait"] if f"fill3:{p['m']}:{p['date']}" in rt}
+    wait_d = [p for p in wait_d if p["m"] not in filled_m]
+    held_d = [o for o in state["d_open"] if o["fill_date"] < today and 1 <= _days(o["fill_date"], today) <= D_HOLD
+              and f"tp3:{o['m']}:{o['date']}" not in rt]
+    need = sorted(set(watch) | {o["m"] for o in held} | {o["m"] for o in held_c}
+                  | {p["m"] for p in wait_d} | {o["m"] for o in held_d})
     kj_sent = check_kijun_intraday(today, rt, dry)
     if not need:
         if kj_sent:
@@ -871,6 +1118,31 @@ def run_intraday(dry=False):
             r = px / o["entry"] * (1 - FEE) ** 2 - 1
             rt["tp2:" + o["m"]] = today
             tps_c.append(f"• {o['name']} ({o['m'][4:]}) {fmt_price(o['entry'])} → {fmt_price(px)}원  {r * 100:+.1f}% · 지금 {fmt_price(k[3])}원")
+    fills_d, tps_d, done_m = [], [], set()
+    for p in sorted(wait_d, key=lambda x: x["date"]):
+        k = cand.get(p["m"])
+        if p["m"] in done_m or not k or k[2] > p["lim"]:
+            continue
+        entry = min(k[0], p["lim"])
+        rt[f"fill3:{p['m']}:{p['date']}"] = today
+        done_m.add(p["m"])
+        fills_d.append(f"🟣 <b>{html.escape(p['name'])} ({html.escape(p['m'][4:])})</b>\n"
+                       f"   매수가 {fmt_price(entry)}원 (지정가 {fmt_price(p['lim'])}) · 지금 {fmt_price(k[3])}원\n"
+                       f"   🎯 매도 지정가 <b>{fmt_price(entry * (1 + D_TP))}원 (+10%)</b> · 지금 걸어두기\n"
+                       f"   ⏳ {_shift(today, D_HOLD)[5:]}까지 안 닿으면 그날 종가에 정리")
+    for o in held_d:
+        k = cand.get(o["m"])
+        tp = o["entry"] * (1 + D_TP)
+        if k and k[1] >= tp:
+            r = tp / o["entry"] * (1 - FEE) ** 2 - 1
+            rt[f"tp3:{o['m']}:{o['date']}"] = today
+            tps_d.append(f"• {o['name']} ({o['m'][4:]}) {fmt_price(o['entry'])} → {fmt_price(tp)}원  {r * 100:+.1f}% · 지금 {fmt_price(k[3])}원")
+    if fills_d:
+        send_telegram(f"🟣 <b>[거래절벽] 매수 지정가 체결 (가상) {len(fills_d)}개</b>\n\n" + "\n\n".join(fills_d)
+                      + "\n\n손절 없음 · 확정 기록은 자정에", dry, as_html=True)
+    if tps_d:
+        send_telegram(f"✅ [거래절벽] +10% 목표 도달 (가상) {len(tps_d)}개\n\n" + "\n".join(tps_d)
+                      + "\n\n확정 결과와 누적 성적은 자정에", dry)
     if tps_c:
         send_telegram(f"✅ [꼬리반등] +15% 목표 도달 (가상) {len(tps_c)}개\n\n" + "\n".join(tps_c)
                       + "\n\n확정 결과와 누적 성적은 자정에", dry)
@@ -883,8 +1155,9 @@ def run_intraday(dry=False):
     cutoff = (datetime.now(KST) - timedelta(days=7)).strftime("%Y-%m-%d")
     state["b_rt"] = {k: d for k, d in rt.items() if d >= cutoff}
     save_state(state)
-    log(f"장중: 대기 {len(watch)}개·보유 {len(held)}개·꼬리반등 {len(held_c)}개 확인, 체결 {len(fills)}개, "
-        f"목표 도달 {len(tps)}개, 꼬리반등 도달 {len(tps_c)}개, {time.monotonic() - t0:.0f}초")
+    log(f"장중: 대기 {len(watch)}개·보유 {len(held)}개·꼬리반등 {len(held_c)}개·거래절벽 대기 {len(wait_d)}개/보유 {len(held_d)}개 확인, "
+        f"체결 {len(fills)}개, 목표 도달 {len(tps)}개, 꼬리반등 도달 {len(tps_c)}개, "
+        f"거래절벽 체결 {len(fills_d)}개/도달 {len(tps_d)}개, {time.monotonic() - t0:.0f}초")
 
 
 def _safe(fn, *a):
@@ -911,6 +1184,10 @@ def check(market):
     print(f"  오늘 매수 대기: " + (f"지정가 {fmt_price(w['level'])} → 목표 {fmt_price(w['tgt'])}" if w else "아님"))
     cs = c_scan(rows) if len(rows) >= 101 else []
     print("[꼬리반등] 창 안 후보: " + (", ".join(f"{s['date']} {fmt_price(s['entry'])}{' ✅신호' if s['valid'] else ''}" for s in cs) or "없음"))
+    ds = d_backtest(rows)
+    print("[거래절벽] 창 안 거래: " + (", ".join(f"{t['date']} 매수 {fmt_price(t['entry'])} {t['r'] * 100:+.1f}%" for t in ds) or "없음"))
+    s = d_signal(rows, len(rows) - 1)
+    print("  어제 신호: " + (f"있음 · 매수 지정가 {fmt_price(s['lim'])}" if s else "없음"))
 
 
 def main():
