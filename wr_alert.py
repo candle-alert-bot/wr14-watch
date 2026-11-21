@@ -422,6 +422,7 @@ def run_strategy_c(state, markets, data, dry):
                       f"   💰 매수가 <b>{fmt_price(o['entry'])}원</b> ({o['date'][5:]} 종가 · 지금 매수)",
                       f"   🎯 매도 지정가 <b>{fmt_price(o['entry'] * (1 + C_TP))}원 (+15%)</b> · 매수 직후 걸어두기",
                       f"   ⏳ {exp}까지 안 닿으면 그날 종가에 정리 · 손절 없음",
+                      "   ⚖️ 권장 비중: <b>자산의 1/3</b> (백테스트 기준)",
                       f"   이격도 {s['ratio'] * 100:.0f} · 7일선 위 {s['gap7'] * 100:.1f}% · 급락 {s['drop'] * 100:.0f}% · 거래대금 {fmt_won(s['liq'])}/일",
                       ""]
         lines.append("⚠️ 승률 85%는 과거 기록이에요. 진 거래는 평균 -13%였어요(최악 -23%).")
