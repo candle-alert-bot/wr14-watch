@@ -39,6 +39,8 @@
 [주봉·일봉 WR(14) 하위 목록 (WR_BOTTOM_N, 기본 10개)]
   매일 자정 직후 한 번, 20일 평균 거래대금 1억 이상 코인 중 주봉·일봉 WR이 둘 다 낮은 순서
   (둘 중 높은 값 기준)로 하위 10개를 알림. 둘 다 -95 이하면 ★ 표시
+  + 장중에 주봉·일봉 WR이 둘 다 -100을 찍은 뒤(그날 저가 = 최근 14주 최저가)
+    7일 안에 처음으로 상승 마감(전날 종가보다 높게)하면 알림 (WR100_REBOUND=0이면 끔)
 
 [일목 기준선 매도 알림 (KIJUN_WATCH 코인, 기본 KRW-HUMA)]
   기준선 = 최근 26일(오늘 포함) 최고가와 최저가의 중간
@@ -92,6 +94,8 @@ C_TP, C_HOLD = 0.15, 14
 C_MAX_LIQ = 5e8
 KIJUN_WATCH = [m.strip().upper() for m in os.getenv("KIJUN_WATCH", "KRW-HUMA").split(",") if m.strip()]
 WR_BOTTOM_N = int(os.getenv("WR_BOTTOM_N", "10"))   # 매일 자정 주봉·일봉 WR 하위 목록 개수 (0이면 끔)
+R_ON = os.getenv("WR100_REBOUND", "1") != "0"        # -100/-100 터치 뒤 첫 상승 마감 알림
+R_LOOKBACK = 7                                       # 터치 후 며칠 안의 상승 마감까지 볼지
 C_NOTE = "백테스트(빗썸 2020~2026) 68건 · 승률 85% · 평균 +10.2% · 평균 7.6일 보유"
 # 전략 ③ 거래절벽 급락 반등
 D_ON = os.getenv("CLIFF_STRATEGY", "1") != "0"
@@ -753,6 +757,76 @@ def run_wr_bottom(state, markets, data, dry):
     return len(lst)
 
 
+def wr100_touch(rows):
+    """각 날짜에 저가가 최근 14주(이번 주 포함) 최저가였는지 = 장중 주봉·일봉 WR(14) 둘 다 -100 터치"""
+    n = len(rows)
+    t = [r[0] for r in rows]; l = [r[2] for r in rows]
+    wk = [week_key(x) for x in t]
+    weeks, wlow = [], []
+    touch = [False] * n
+    cur_min = None
+    for i in range(n):
+        if not weeks or weeks[-1] != wk[i]:
+            weeks.append(wk[i]); wlow.append(l[i]); cur_min = None
+        q = len(weeks) - 1
+        if q >= PERIOD - 1 and i >= PERIOD - 1:
+            prev = min(wlow[q - PERIOD + 1:q])
+            day = min(l[i - PERIOD + 1:i])
+            touch[i] = l[i] <= prev and l[i] <= day and (cur_min is None or l[i] <= cur_min)
+        cur_min = l[i] if cur_min is None else min(cur_min, l[i])
+        wlow[q] = min(wlow[q], l[i])
+    return touch
+
+
+def wr100_rebound(rows):
+    """마지막 마감일이 '-100/-100 터치 후 첫 상승 마감'이면 정보, 아니면 None"""
+    n = len(rows)
+    if n < 120:
+        return None
+    c = [r[3] for r in rows]
+    L = n - 1
+    if not c[L] > c[L - 1]:
+        return None
+    touch = wr100_touch(rows)
+    T = next((j for j in range(L, max(L - R_LOOKBACK, 0) - 1, -1) if touch[j]), None)
+    if T is None:
+        return None
+    if any(c[j] > c[j - 1] for j in range(T, L)):     # 터치 뒤 이미 상승 마감한 날이 있으면 첫 번째가 아님
+        return None
+    return {"date": rows[L][0], "close": c[L], "chg": c[L] / c[L - 1] - 1, "touch_date": rows[T][0],
+            "touch_low": rows[T][2], "from_low": c[L] / rows[T][2] - 1}
+
+
+def run_wr100_rebound(state, markets, data, dry):
+    """매일 자정: -100/-100 터치 뒤 첫 상승 마감 코인 알림 (20일 평균 거래대금 1억 이상)"""
+    if not R_ON:
+        return 0
+    hits = []
+    for m, name in markets.items():
+        rows, _ = data.get(m, (None, None))
+        s = wr100_rebound(rows) if rows else None
+        if not s or state["r_alerted"].get(m) == s["date"]:
+            continue
+        t, h, l, c, wr_d, wr_w, liq = indicators(rows)
+        if liq[-1] < MIN_LIQ:
+            continue
+        state["r_alerted"][m] = s["date"]
+        hits.append((m, name, s, wr_w[-1], wr_d[-1], liq[-1]))
+    if hits:
+        hits.sort(key=lambda x: -x[5])
+        lines = [f"🔄 [WR -100 반등] {hits[0][2]['date'][5:]} 상승 마감 {len(hits)}개" + (" (거래대금 상위 20개만 표시)" if len(hits) > 20 else ""), ""]
+        for m, name, s, ww, wd, lq in hits[:20]:
+            f = lambda x: "-" if x is None else f"{x:.1f}"
+            lines += [f"• {name} ({m[4:]}) 종가 {fmt_price(s['close'])}원 ({s['chg'] * 100:+.1f}%)",
+                      f"   {s['touch_date'][5:]} 저가 {fmt_price(s['touch_low'])}원에서 -100/-100 터치 → 저가 대비 {s['from_low'] * 100:+.1f}%",
+                      f"   지금 주봉 {f(ww)} / 일봉 {f(wd)} · 거래대금 {fmt_won(lq)}/일", ""]
+        if len(hits) > 20:
+            lines += ["나머지: " + ", ".join(x[0][4:] for x in hits[20:]), ""]
+        lines.append("터치 = 그날 저가가 최근 14주 최저가 · 터치 후 7일 안의 첫 상승 마감만 · 매수 신호가 아니라 알림이에요")
+        send_telegram("\n".join(lines).strip(), dry)
+    return len(hits)
+
+
 def run_kijun(state, markets, data, dry):
     lines = []
     for m in KIJUN_WATCH:
@@ -831,6 +905,7 @@ def load_state():
     s.setdefault("d_alerted", {})
     s.setdefault("d_last", {})       # ③ 코인별 마지막 체결 신호일
     s.setdefault("d_stats", {"n": 0, "wins": 0, "sum": 0.0})
+    s.setdefault("r_alerted", {})    # -100 반등 알림 보낸 날짜
     s.setdefault("k_daily", {})
     s.setdefault("b_rt", {})          # 장중 알림 보낸 기록 {"fill:KRW-X": 날짜, "tp:KRW-X": 날짜}
     s.pop("active", None)           # 이전 버전 항목 정리
@@ -979,8 +1054,9 @@ def run_once(dry=False):
     # 5) 일목 기준선 매도 알림
     run_kijun(state, markets, data, dry)
 
-    # 6) 주봉·일봉 WR 하위 목록
+    # 6) 주봉·일봉 WR 하위 목록 + -100 터치 후 상승 마감
     run_wr_bottom(state, markets, data, dry)
+    run_wr100_rebound(state, markets, data, dry)
 
     # 오래된 기록 정리 + 실행 기록
     cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -989,6 +1065,7 @@ def run_once(dry=False):
     state["c_alerted"] = {m: d for m, d in state["c_alerted"].items() if d >= cutoff}
     state["d_alerted"] = {m: d for m, d in state["d_alerted"].items() if d >= cutoff}
     state["d_last"] = {m: d for m, d in state["d_last"].items() if d >= cutoff}
+    state["r_alerted"] = {m: d for m, d in state["r_alerted"].items() if d >= cutoff}
     state["last_run"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     save_state(state)
     log(f"신호 {len(signals)}개, 청산 {len(closed_msgs)}개, 보유 중 {len(state['open'])}개 | "
