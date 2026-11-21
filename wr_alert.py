@@ -1322,6 +1322,11 @@ def main():
         log("텔레그램 설정이 없어 화면 출력 모드로 실행합니다.")
     try:
         if a.intraday:
+            # GitHub 예약 실행이 늦거나 빠지는 경우가 있어서, 오늘 자정 실행이 아직 없으면 먼저 대신 실행
+            today = datetime.now(KST).strftime("%Y-%m-%d")
+            if (load_state().get("last_run") or "")[:10] != today:
+                log("오늘 자정 실행 기록이 없어 지금 대신 실행합니다.")
+                run_once(a.dry_run)
             run_intraday(a.dry_run)
         else:
             run_once(a.dry_run)
