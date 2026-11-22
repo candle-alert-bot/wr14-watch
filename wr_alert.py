@@ -930,15 +930,17 @@ def run_strategy_e(state, markets, data, dry):
 
     # 3) 새 신호 (어제 마감 일봉) · 투자유의 제외 · 대기·보유 중인 코인 제외 · 하루 5개
     busy = {p["m"] for p in state["e_wait"]} | {o["m"] for o in state["e_open"]}
-    cands, last_day = [], None
+    cands, last_day, todo = [], None, []
     for m, name in markets.items():
         rows, _ = data.get(m, (None, None))
         if not rows or len(rows) < 31 or m in CAUTION or m in busy:
             continue
         last_day = last_day or rows[-1][0]
-        if state["e_alerted"].get(m) == rows[-1][0]:
-            continue
-        hit = e_scan_today(m, rows, state["e_old"])
+        if state["e_alerted"].get(m) != rows[-1][0]:
+            todo.append((m, name, rows))
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:     # 추가 조회(이전 일봉·상장일)를 동시에
+        hits = list(ex.map(lambda x: e_scan_today(x[0], x[2], state["e_old"]), todo))
+    for (m, name, _), hit in zip(todo, hits):
         if hit:
             cands.append((m, name) + hit)
     cands.sort(key=lambda x: -x[3]["liq"])
