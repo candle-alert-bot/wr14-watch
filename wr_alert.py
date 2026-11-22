@@ -111,6 +111,7 @@ D_RATIO7, D_VOL3, D_RET7 = 0.83, 0.30, -0.10   # 7일선 대비 종가, 3일 거
 D_DIP, D_WAIT = 0.05, 2       # 신호일 종가 -5% 지정가, 다음 2일 동안
 D_TP, D_HOLD, D_COOL = 0.10, 14, 14
 D_MIN_AGE = 120
+D_SLOT, D_SLOTS = 0.20, 4    # 신호당 계좌의 20%, 보유+대기 합계 최대 4자리(80%) · 넘치는 신호는 "건너뜀" 표시(가상 기록은 그대로)
 D_CUT_DAY, D_CUT = 3, 0.10   # 체결 후 3일째 종가가 진입가 -10% 이하면 매도 고려 알림 (자동 청산 아님)
 D_NOTE = "백테스트(빗썸 2020~2026) 82건 · 승률 93% · 평균 +7.4% · 보유 중앙값 1일"
 # 전략 ④⑤⑥ 급락 지정가 (가상 기록)
@@ -618,7 +619,8 @@ def run_strategy_d(state, markets, data, dry):
     ref = max((rows[-1][0] for rows, _ in data.values() if rows), default=None)
     for p in sorted(state["d_wait"], key=lambda x: x["date"]):
         if last.get(p["m"]) and _days(last[p["m"]], p["date"]) < D_COOL:
-            act(12, f"❌ [③] {e(p['name'])} 매수 지정가 {fmt_price(p['lim'])}원 주문 취소 (같은 코인 다른 주문이 체결됨)")
+            if not p.get("skip"):
+                act(12, f"❌ [③] {e(p['name'])} 매수 지정가 {fmt_price(p['lim'])}원 주문 취소 (같은 코인 다른 주문이 체결됨)")
             continue
         rows, _ = data.get(p["m"], (None, None))
         f = d_fill(p, rows) if rows else None
@@ -631,6 +633,8 @@ def run_strategy_d(state, markets, data, dry):
         else:
             last[p["m"]] = p["date"]
             o = {"m": p["m"], "name": p["name"], "date": p["date"], "lim": p["lim"], "fill_date": f[1], "entry": f[2]}
+            if p.get("skip"):
+                o["skip"] = True
             state["d_open"].append(o)
             if rt.get(f"fill3:{p['m']}:{p['date']}") != f[1]:
                 fills.append(o)
@@ -671,6 +675,18 @@ def run_strategy_d(state, markets, data, dry):
         state["d_wait"].append(p)
         sigs.append((p, s, prev))
 
+    # 3-1) 자리 배정: 기존 대기+보유(건너뛴 것 제외) 다음으로 거래대금 큰 신호부터, 4자리 넘으면 건너뜀
+    new_ids = {id(p) for p, _, _ in sigs}
+    used = sum(1 for p in state["d_wait"] if id(p) not in new_ids and not p.get("skip")) \
+        + sum(1 for o in state["d_open"] if not o.get("skip"))
+    for p, s, _ in sorted(sigs, key=lambda x: -x[1]["liq"]):
+        if used < D_SLOTS:
+            used += 1
+            p["slot"] = used
+        else:
+            p["skip"] = True
+    slots_txt = f"{used}/{D_SLOTS}"
+
     # 4) 알림
     if sigs:
         lines = ["🚨🚨 <b>매수 지정가 신호</b> 🚨🚨",
@@ -683,21 +699,25 @@ def run_strategy_d(state, markets, data, dry):
             except Exception as ex:
                 log(f"현재가 조회 실패 {p['m']}: {ex}")
                 now = None
-            act(20, f"🛒 <b>[③거래절벽] {e(p['name'])} ({e(p['m'][4:])})</b> 매수 지정가 <b>{fmt_price(p['lim'])}원</b> 걸기"
-                    f" ({until} 밤 12시까지) · 비중 1/3"
-                    + (" · 지금 이미 지정가 아래" if now is not None and now <= p["lim"] else ""))
+            cap = f"1회 진입 {fmt_won(s['liq'] * 0.01)} 이내"
+            if p.get("skip"):
+                act(20, f"⛔ [③거래절벽] {e(p['name'])} ({e(p['m'][4:])}) 신호 · <b>한도 초과, 건너뜀</b> (자리 {slots_txt} 다 참)")
+            else:
+                act(20, f"🛒 <b>[③거래절벽] {e(p['name'])} ({e(p['m'][4:])})</b> 매수 지정가 <b>{fmt_price(p['lim'])}원</b> 걸기"
+                        f" ({until} 밤 12시까지) · 비중 {D_SLOT * 100:.0f}% · 자리 {p['slot']}/{D_SLOTS} · {cap}"
+                        + (" · 지금 이미 지정가 아래" if now is not None and now <= p["lim"] else ""))
             if now is None:
                 now_line = "   📈 지금가: 조회 실패 · 빗썸에서 직접 확인"
             else:
                 now_line = (f"   📈 지금 {fmt_price(now)}원 (종가 대비 {(now / p['close'] - 1) * 100:+.1f}%)"
                             + (" · <b>이미 지정가 아래 · 바로 체결</b>" if now <= p["lim"] else ""))
-            lines += [f"🔥 <b>{e(p['name'])} ({e(p['m'][4:])})</b>",
+            lines += [f"🔥 <b>{e(p['name'])} ({e(p['m'][4:])})</b>" + ("  ⛔ <b>한도 초과, 건너뜀</b> (가상 기록만)" if p.get("skip") else ""),
                       f"   🛒 매수 지정가 <b>{fmt_price(p['lim'])}원</b> ({p['date'][5:]} 종가 {fmt_price(p['close'])}원 -5%)",
                       f"   ⏳ {until} 밤 12시까지 유효 · 안 닿으면 취소",
                       now_line,
                       f"   🎯 체결되면 바로 매도 지정가 = 매수가 +10% (지정가로 사면 <b>{fmt_price(p['lim'] * (1 + D_TP))}원</b>)",
                       f"   ⏳ 체결 후 {D_HOLD}일 안에 안 닿으면 그날 종가에 정리 · {D_CUT_DAY}일째 종가가 매수가 -{D_CUT * 100:.0f}% 이하면 매도 고려 알림",
-                      "   ⚖️ 권장 비중: <b>자산의 1/3</b> (백테스트 기준)",
+                      f"   ⚖️ 권장 비중: <b>계좌의 {D_SLOT * 100:.0f}%</b> · 보유+대기 최대 {D_SLOTS}개 · 1회 진입액은 20일 평균 거래대금의 1%({fmt_won(s['liq'] * 0.01)}) 이내",
                       f"   7일선 대비 {(s['ratio'] - 1) * 100:.0f}% · 3일 거래대금 {s['vol3'] * 100:.0f}% (20일 평균 대비)"
                       f" · 7일 {s['ret7'] * 100:.0f}% · 거래대금 {fmt_won(s['liq'])}/일"]
             if prev:
@@ -708,30 +728,37 @@ def run_strategy_d(state, markets, data, dry):
 
     msg = []
     for o in fills:
+        if o.get("skip"):
+            continue
         act(15, f"🟣 [③] {e(o['name'])} {o['fill_date'][5:]} 체결(가상) {fmt_price(o['entry'])}원"
                 f" → 매도 지정가 <b>{fmt_price(o['entry'] * (1 + D_TP))}원</b> 걸기 ({_shift(o['fill_date'], D_HOLD)[5:]}까지)")
     for p in expired:
+        if p.get("skip"):
+            continue
         act(12, f"❌ [③] {e(p['name'])} 매수 지정가 {fmt_price(p['lim'])}원 주문 취소 (기한 끝, 미체결)")
     daily = last_day is not None and state.get("d_daily") != last_day
     if daily:
         state["d_daily"] = last_day
     old_wait = [p for p in state["d_wait"] if p["date"] != last_day]
     if daily and (old_wait or state["d_open"]):
-        msg += ["[거래절벽]"]
+        nw = sum(1 for p in state["d_wait"] if not p.get("skip"))
+        no = sum(1 for o in state["d_open"] if not o.get("skip"))
+        msg += [f"[거래절벽] 자리 {nw + no}/{D_SLOTS} 사용 (보유 {no} · 대기 {nw}) · 신호당 {D_SLOT * 100:.0f}%"]
+        act(19, f"📦 [③] 자리 {nw + no}/{D_SLOTS} 사용 (보유 {no} · 대기 {nw}) · 남은 {max(D_SLOTS - nw - no, 0)}자리 · 신호당 계좌의 {D_SLOT * 100:.0f}%")
         for p in old_wait:
-            msg.append(f"• 대기 {p['name']} ({p['m'][4:]}) 매수 지정가 {fmt_price(p['lim'])} · {_shift(p['date'], D_WAIT)[5:]}까지")
+            msg.append(("• (건너뜀) " if p.get("skip") else "• ") + f"대기 {p['name']} ({p['m'][4:]}) 매수 지정가 {fmt_price(p['lim'])} · {_shift(p['date'], D_WAIT)[5:]}까지")
         for o in state["d_open"]:
             rows, _ = data.get(o["m"], (None, None))
             if not rows:
                 continue
             cl, left = rows[-1][3], D_HOLD - _days(o["fill_date"], rows[-1][0])
-            if left == 1:
+            if left == 1 and not o.get("skip"):
                 act(30, f"⏰ [③] {e(o['name'])} 오늘이 {D_HOLD}일째 · +10% 못 닿으면 자정 전에 정리")
-            if rows[-1][0] == _shift(o["fill_date"], D_CUT_DAY) and cl <= o["entry"] * (1 - D_CUT):
+            if rows[-1][0] == _shift(o["fill_date"], D_CUT_DAY) and cl <= o["entry"] * (1 - D_CUT) and not o.get("skip"):
                 act(25, f"✂️ <b>[③] {e(o['name'])} ({e(o['m'][4:])}) 매도 고려</b> · {D_CUT_DAY}일째 종가 {fmt_price(cl)}원"
                         f" (진입가 {fmt_price(o['entry'])} 대비 {(cl / o['entry'] - 1) * 100:+.1f}%)"
                         f" · 백테스트상 이때 정리하면 큰 손실은 줄지만 늦게 오르는 경우도 놓쳐요")
-            msg.append(f"• 보유 {o['name']} ({o['m'][4:]}) {o['fill_date'][5:]} 매수 {fmt_price(o['entry'])} · 목표 {fmt_price(o['entry'] * (1 + D_TP))}"
+            msg.append(("• (건너뜀) " if o.get("skip") else "• ") + f"보유 {o['name']} ({o['m'][4:]}) {o['fill_date'][5:]} 매수 {fmt_price(o['entry'])} · 목표 {fmt_price(o['entry'] * (1 + D_TP))}"
                        f" · 어제 종가 {fmt_price(cl)} ({(cl / o['entry'] - 1) * 100:+.0f}%) · 남은 {left}일")
     if msg:
         send_telegram("\n".join(msg).strip(), dry, sec="hold")
