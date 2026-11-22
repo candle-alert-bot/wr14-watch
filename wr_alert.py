@@ -111,6 +111,7 @@ D_RATIO7, D_VOL3, D_RET7 = 0.83, 0.30, -0.10   # 7일선 대비 종가, 3일 거
 D_DIP, D_WAIT = 0.05, 2       # 신호일 종가 -5% 지정가, 다음 2일 동안
 D_TP, D_HOLD, D_COOL = 0.10, 14, 14
 D_MIN_AGE = 120
+D_CUT_DAY, D_CUT = 3, 0.10   # 체결 후 3일째 종가가 진입가 -10% 이하면 매도 고려 알림 (자동 청산 아님)
 D_NOTE = "백테스트(빗썸 2020~2026) 82건 · 승률 93% · 평균 +7.4% · 보유 중앙값 1일"
 # 전략 ④⑤⑥ 급락 지정가 (가상 기록)
 E_ON = os.getenv("DIP_STRATEGY", "1") != "0"
@@ -695,7 +696,7 @@ def run_strategy_d(state, markets, data, dry):
                       f"   ⏳ {until} 밤 12시까지 유효 · 안 닿으면 취소",
                       now_line,
                       f"   🎯 체결되면 바로 매도 지정가 = 매수가 +10% (지정가로 사면 <b>{fmt_price(p['lim'] * (1 + D_TP))}원</b>)",
-                      f"   ⏳ 체결 후 {D_HOLD}일 안에 안 닿으면 그날 종가에 정리 · 손절 없음",
+                      f"   ⏳ 체결 후 {D_HOLD}일 안에 안 닿으면 그날 종가에 정리 · {D_CUT_DAY}일째 종가가 매수가 -{D_CUT * 100:.0f}% 이하면 매도 고려 알림",
                       "   ⚖️ 권장 비중: <b>자산의 1/3</b> (백테스트 기준)",
                       f"   7일선 대비 {(s['ratio'] - 1) * 100:.0f}% · 3일 거래대금 {s['vol3'] * 100:.0f}% (20일 평균 대비)"
                       f" · 7일 {s['ret7'] * 100:.0f}% · 거래대금 {fmt_won(s['liq'])}/일"]
@@ -726,6 +727,10 @@ def run_strategy_d(state, markets, data, dry):
             cl, left = rows[-1][3], D_HOLD - _days(o["fill_date"], rows[-1][0])
             if left == 1:
                 act(30, f"⏰ [③] {e(o['name'])} 오늘이 {D_HOLD}일째 · +10% 못 닿으면 자정 전에 정리")
+            if rows[-1][0] == _shift(o["fill_date"], D_CUT_DAY) and cl <= o["entry"] * (1 - D_CUT):
+                act(25, f"✂️ <b>[③] {e(o['name'])} ({e(o['m'][4:])}) 매도 고려</b> · {D_CUT_DAY}일째 종가 {fmt_price(cl)}원"
+                        f" (진입가 {fmt_price(o['entry'])} 대비 {(cl / o['entry'] - 1) * 100:+.1f}%)"
+                        f" · 백테스트상 이때 정리하면 큰 손실은 줄지만 늦게 오르는 경우도 놓쳐요")
             msg.append(f"• 보유 {o['name']} ({o['m'][4:]}) {o['fill_date'][5:]} 매수 {fmt_price(o['entry'])} · 목표 {fmt_price(o['entry'] * (1 + D_TP))}"
                        f" · 어제 종가 {fmt_price(cl)} ({(cl / o['entry'] - 1) * 100:+.0f}%) · 남은 {left}일")
     if msg:
