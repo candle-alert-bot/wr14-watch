@@ -120,6 +120,7 @@ E_KINDS = {   # 같은 날 여러 조건에 맞으면 앞 번호 하나만
     "5": {"tag": "⑤ 상승추세 눌림", "dip": 0.10, "note": "101건 · 승률 98%"},
     "6": {"tag": "⑥ 오래된 코인 폭락", "dip": 0.10, "note": "160건 · 승률 98%"},
 }
+MIDNIGHT_DELAY = int(os.getenv("MIDNIGHT_DELAY", "15"))   # 자정 몇 초 뒤에 시작할지 (마지막 일봉 확정 여유)
 CAUTION = set()   # 투자유의 코인 (krw_markets에서 채움)
 EXCLUDE = {"USDT", "USDC", "USDE", "USDS", "USD1", "USDG", "DAI", "PAXG", "XAUT", "FDUSD", "PYUSD", "TUSD"}
 
@@ -1702,6 +1703,37 @@ def run_intraday(dry=False):
         f"거래절벽 체결 {len(fills_d)}개/도달 {len(tps_d)}개, ④⑤⑥ {len(ev_e)}건, {time.monotonic() - t0:.0f}초")
 
 
+def wait_midnight():
+    """자정 대기: 23시쯤 미리 시작해서 다음 자정(00:00 KST) 몇 초 뒤까지 기다린 뒤 끝남.
+    오늘 자정 실행이 이미 끝났으면 기다리지 않고 skip. GitHub Actions 출력에 skip=true/false"""
+    now = datetime.now(KST)
+    target = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if now.hour >= 12:
+        target += timedelta(days=1)
+    day = target.strftime("%Y-%m-%d")
+    skip = (load_state().get("last_run") or "") >= day + " 00:00"
+    if skip:
+        log(f"{day} 자정 실행이 이미 끝나서 건너뜁니다.")
+    else:
+        wait = (target - now).total_seconds() + MIDNIGHT_DELAY
+        if wait > 0:
+            log(f"{target:%m-%d %H:%M} 자정까지 {wait / 60:.1f}분 기다립니다.")
+            time.sleep(wait)
+        for _ in range(24):            # 새 일봉이 열렸는지 확인 (최대 2분)
+            try:
+                d = api_get("/candles/days", {"market": "KRW-BTC", "count": 1})
+                if d and d[0]["candle_date_time_kst"][:10] == day:
+                    break
+            except Exception as e:
+                log(f"새 일봉 확인 실패: {e}")
+            time.sleep(5)
+        log("자정 지남 · 바로 실행합니다.")
+    out = os.getenv("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"skip={'true' if skip else 'false'}\n")
+
+
 def _safe(fn, *a):
     try:
         return fn(*a)
@@ -1741,7 +1773,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--check", metavar="MARKET")
     ap.add_argument("--intraday", action="store_true")
+    ap.add_argument("--wait-midnight", action="store_true", help="다음 자정까지 기다렸다가 끝남 (워크플로가 이어서 실행)")
     a = ap.parse_args()
+    if a.wait_midnight:
+        wait_midnight()
+        return
     if a.check:
         check(a.check.upper())
         return
