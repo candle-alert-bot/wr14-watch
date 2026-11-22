@@ -2,22 +2,60 @@ name: wr-alert
 
 on:
   schedule:
-    - cron: "5 15 * * *"    # 매일 00:05 (한국시간) — 일봉 마감 직후 확인
-    - cron: "40 15 * * *"   # 00:40 한 번 더 (GitHub 실행 지연·누락 대비, 중복 알림 없음)
-    - cron: "20 * * * *"    # 매시 20분 — 장중 지정가 체결·목표가 도달 확인 (90일선 전략)
+    - cron: "0 14 * * *"    # 23:00 (한국시간) — 미리 켜두고 자정까지 기다렸다가 00:00:15에 바로 실행
+    - cron: "30 14 * * *"   # 23:30 — 위 실행이 늦거나 빠졌을 때 대비 (이미 했으면 건너뜀)
+    - cron: "5 15 * * *"    # 00:05 — 위 둘이 모두 빠졌을 때 대비 (중복 알림 없음)
+    - cron: "40 15 * * *"   # 00:40 한 번 더
+    - cron: "20 * * * *"    # 매시 20분 — 장중 지정가 체결·목표가 도달 확인
   workflow_dispatch:         # Actions 탭에서 수동 실행 (자정 확인과 같은 동작)
 
 permissions:
   contents: write            # 알림·가상 매매 기록 저장
 
-concurrency:
-  group: wr-alert
-  cancel-in-progress: false
-
 jobs:
+  midnight:
+    if: github.event.schedule == '0 14 * * *' || github.event.schedule == '30 14 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: wr-midnight
+      cancel-in-progress: false
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      REQ_PER_SEC: "30"
+      WORKERS: "12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 자정까지 대기
+        id: wait
+        run: python3 wr_alert.py --wait-midnight
+
+      - name: 자정 실행 (최신 기록으로)
+        if: steps.wait.outputs.skip != 'true'
+        run: |
+          git fetch -q origin main && git reset -q --hard origin/main   # 기다리는 동안 바뀐 기록 반영
+          python3 wr_alert.py
+
+      - name: 기록 저장 (바뀌었을 때만)
+        if: steps.wait.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in wr_state.json trades.csv; do [ -f "$f" ] && git add "$f"; done
+          git diff --cached --quiet && exit 0
+          git commit -m "update state"
+          for i in 1 2 3 4; do git push && exit 0; sleep $((i * 5)); git pull --rebase -q; done
+          exit 1
+
   check:
+    if: github.event.schedule != '0 14 * * *' && github.event.schedule != '30 14 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: wr-alert
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -38,4 +76,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for f in wr_state.json trades.csv; do [ -f "$f" ] && git add "$f"; done
-          git diff --cached --quiet || (git commit -m "update state" && git push)
+          git diff --cached --quiet && exit 0
+          git commit -m "update state"
+          for i in 1 2 3 4; do git push && exit 0; sleep $((i * 5)); git pull --rebase -q; done
+          exit 1
