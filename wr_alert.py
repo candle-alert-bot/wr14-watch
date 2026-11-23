@@ -1206,6 +1206,9 @@ def check_kijun_intraday(today, rt, dry):
         except Exception as e:
             log(f"기준선 조회 실패 {m}: {e}")
             continue
+        if not isinstance(data, list) or not all(isinstance(x, dict) and "candle_date_time_kst" in x for x in data):
+            log(f"기준선 조회 응답 이상 {m}: {str(data)[:100]}")
+            continue
         days = sorted(data, key=lambda x: x["candle_date_time_kst"])
         closed = [x for x in days if x["candle_date_time_kst"][:10] < today][-25:]
         td = [x for x in days if x["candle_date_time_kst"][:10] == today]
@@ -1802,6 +1805,16 @@ def check(market):
           + "어제 신호: " + (f"{E_KINDS[hit[0]]['tag']} · 매수 지정가 {fmt_price(hit[1]['close'] * (1 - E_KINDS[hit[0]]['dip']))}" if hit else "없음"))
 
 
+def bithumb_up():
+    """빗썸 API가 정상 응답하는지 (점검·장애면 False)"""
+    try:
+        d = api_get("/candles/days", {"market": "KRW-BTC", "count": 1})
+        return isinstance(d, list) and bool(d) and "candle_date_time_kst" in d[0] and float(d[0]["trade_price"]) > 0
+    except Exception as e:
+        log(f"빗썸 응답 확인 실패: {e}")
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description="빗썸 과매도 반등 신호 알림")
     ap.add_argument("--dry-run", action="store_true")
@@ -1817,6 +1830,10 @@ def main():
         return
     if not a.dry_run and not (TG_TOKEN and TG_CHAT):
         log("텔레그램 설정이 없어 화면 출력 모드로 실행합니다.")
+    if not bithumb_up():
+        # 점검·장애 중: 아무것도 저장하지 않고 성공으로 끝냄 (다음 실행에서 이어서 처리)
+        log("빗썸이 응답하지 않아요(점검 또는 장애). 이번 실행은 건너뜁니다.")
+        return
     try:
         if a.intraday:
             # GitHub 예약 실행이 늦거나 빠지는 경우가 있어서, 오늘 자정 실행이 아직 없으면 먼저 대신 실행
@@ -1828,6 +1845,9 @@ def main():
         else:
             run_once(a.dry_run)
     except Exception as e:
+        if not bithumb_up():
+            log(f"실행 중 빗썸 응답이 끊겨 건너뜁니다(저장 안 함): {e}")
+            return
         log(f"실행 오류: {e}")
         sys.exit(1)
 
